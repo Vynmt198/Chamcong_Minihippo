@@ -10,7 +10,7 @@ function importAllBranchesRawLogToMaster() {
   // Khi OK thì bật đủ:
   // const RAW_SHEETS = ["L4_HH", "L1_HH", "L5_HH", "HDK", "TP"];
 
-  const MASTER_FILE_ID = "1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4";
+  const MASTER_FILE_ID = "1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4";  
   const MASTER_SHEET_NAME = "Chấm công th12/2025";
 
   const MASTER_EMP_COL = 2;     // cột mã nhân viên (B)
@@ -119,25 +119,94 @@ function importAllBranchesRawLogToMaster() {
     }
   }
 
-  // ====== 8) WRITE BACK ONCE ======
-  Logger.log(`6) Write back once... updatedCells=${updatedCells}, notFound=${notFound.length}`);
+  // ====== 8) WRITE BACK IN BATCHES ======
+  Logger.log(`6) Write back in batches... updatedCells=${updatedCells}, notFound=${notFound.length}`);
+  let errorCount = 0; // Khai báo ở ngoài để dùng trong alert
   if (updatedCells > 0) {
-    dayBlockRange.setValues(dayBlock);
+    // Tối ưu: Chia nhỏ range thành các batch để tránh timeout
+    // Google Apps Script có giới hạn thời gian thực thi, nên chia nhỏ range
+    const BATCH_SIZE = 50; // Số hàng mỗi batch (có thể điều chỉnh)
+    const totalRows = lastEmpRow;
+    let batchCount = 0;
+    let successCount = 0;
+
+    try {
+      for (let startRow = 1; startRow <= totalRows; startRow += BATCH_SIZE) {
+        const endRow = Math.min(startRow + BATCH_SIZE - 1, totalRows);
+        const batchRows = endRow - startRow + 1;
+        
+        // Lấy phần dayBlock tương ứng với batch này
+        const batchData = [];
+        for (let r = startRow - 1; r < endRow; r++) {
+          batchData.push(dayBlock[r] || []);
+        }
+
+        try {
+          // Ghi batch này
+          const batchRange = masterSh.getRange(startRow, minDayCol, batchRows, dayColsCount);
+          batchRange.setValues(batchData);
+          
+          // Force flush sau mỗi batch để đảm bảo dữ liệu được ghi
+          SpreadsheetApp.flush();
+          
+          batchCount++;
+          successCount += batchRows;
+          Logger.log(`  ✓ Batch ${batchCount}: rows ${startRow}-${endRow} (${batchRows} rows)`);
+          
+          // Nghỉ ngắn giữa các batch để tránh rate limit
+          if (batchCount % 5 === 0) {
+            Utilities.sleep(100); // 100ms nghỉ sau mỗi 5 batch
+          }
+        } catch (batchError) {
+          errorCount++;
+          Logger.log(`  ✗ ERROR in batch ${batchCount} (rows ${startRow}-${endRow}): ${batchError.message}`);
+          // Tiếp tục với batch tiếp theo thay vì dừng hoàn toàn
+        }
+      }
+
+      Logger.log(`6a) Write completed: ${batchCount} batches, ${successCount} rows written, ${errorCount} errors`);
+      
+      if (errorCount > 0) {
+        Logger.log(`WARNING: ${errorCount} batch(es) failed. Some data may not be updated.`);
+      }
+      
+      // QUAN TRỌNG: Flush cuối cùng để đảm bảo tất cả dữ liệu được commit vào sheet
+      // Trước khi hiển thị alert, phải đảm bảo dữ liệu đã được ghi xong
+      SpreadsheetApp.flush();
+      Logger.log("6b) Final flush completed - all data committed to sheet");
+      
+      // Delay ngắn để đảm bảo Google Sheets có thời gian refresh UI
+      // Dữ liệu đã được ghi vào sheet, delay này chỉ để UI refresh
+      Utilities.sleep(200); // 200ms delay
+      
+    } catch (e) {
+      Logger.log(`CRITICAL ERROR during batch write: ${e.message}`);
+      Logger.log(`Stack: ${e.stack}`);
+      throw new Error(`Failed to write data: ${e.message}`);
+    }
   } else {
     Logger.log("No changes -> skip setValues()");
   }
 
   if (notFound.length) Logger.log("Không tìm thấy mã trong sheet tổng: " + notFound.join(", "));
 
+  // Hiển thị thông báo bằng toast (không chặn execution, dữ liệu đã được ghi)
+  // Toast sẽ tự động biến mất sau vài giây, không cần user bấm OK
   try {
-    const ui = SpreadsheetApp.getUi();
-    ui.alert(
-      `Xong! Updated ${updatedCells} ô.\n` +
-      (notFound.length ? `Không tìm thấy ${notFound.length} mã (xem Logger)` : "")
-    );
+    const message = `Đã cập nhật ${updatedCells} ô` +
+      (notFound.length ? ` (${notFound.length} mã không tìm thấy)` : "") +
+      (errorCount > 0 ? ` (${errorCount} batch lỗi)` : "");
+    
+    // Sử dụng toast thay vì alert - toast không chặn execution
+    masterSh.getRange(1, 1).setValue(masterSh.getRange(1, 1).getValue()); // Trigger refresh
+    SpreadsheetApp.getActiveSpreadsheet().toast(message, "Hoàn thành", 5); // 5 giây
+    
+    Logger.log(`Toast notification: ${message}`);
   } catch (e) {
-    Logger.log(`Alert skipped (no UI available). Finished: Updated ${updatedCells} ô.` +
-      (notFound.length ? ` Không tìm thấy ${notFound.length} mã.` : ""));
+    // Fallback: Nếu toast không hoạt động, chỉ log
+    Logger.log(`Notification skipped. Finished: Updated ${updatedCells} ô.` +
+      (notFound.length ? ` Không tìm thấy ${notFound.length} mã.` : "") +
+      (errorCount > 0 ? ` ${errorCount} batch errors.` : ""));
   }
 }
 /**
@@ -446,10 +515,12 @@ function generateNotesForDay_(emp, dayStr, morning, afternoon, cfg, month) {
 
 // --- Special schedules & helpers for exceptions ---
 const SPECIAL_SCHEDULES = {
-  default: { morningStart: "08:30", morningEnd: "12:00", afternoonStart: "13:15", afternoonEnd: "16:30", cutoff: "12:00", lateThreshold: 30 },
+  // Nhân viên bình thường: Ca sáng 8h30-12h, Ca chiều 13h15-16h45
+  default: { morningStart: "08:30", morningEnd: "12:00", afternoonStart: "13:15", afternoonEnd: "16:45", cutoff: "12:00", lateThreshold: 30 },
+  // Quản lý (MH0001-MH0009): Ca sáng 9h00-12h, Ca chiều 13h15-17h15
   managers: {
     ids: ["MH0001", "MH0002", "MH0003", "MH0004", "MH0005", "MH0006", "MH0007", "MH0008", "MH0009"],
-    template: { morningStart: "09:00", morningEnd: "12:00", afternoonStart: "13:15", afternoonEnd: "18:00" }
+    template: { morningStart: "09:00", morningEnd: "12:00", afternoonStart: "13:15", afternoonEnd: "17:15" }
   },
   reception: {
     ids: ["MH0043", "MH0044", "MH0045"],
@@ -462,7 +533,8 @@ const SPECIAL_SCHEDULES = {
   },
   // Add role-driven templates that can be customized later
   parttime: {
-    template: { morningStart: "09:00", morningEnd: "12:00", afternoonStart: "13:30", afternoonEnd: "16:30" }
+    // PART: vẫn là nhân viên thường, ca sáng phải tính từ 08:30 như default
+    template: { morningStart: "08:30", morningEnd: "12:00", afternoonStart: "13:30", afternoonEnd: "16:30" }
   },
   online: {
     template: { morningStart: "08:30", morningEnd: "12:00", afternoonStart: "13:15", afternoonEnd: "16:15" }
@@ -654,13 +726,14 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
         }
       }
 
-      // Tính lateMinutes: chỉ tính nếu check-in quá 30 phút sau giờ bắt đầu ca
+      // Tính lateMinutes: số phút trễ so với giờ bắt đầu ca
       let lateMinutes = 0;
       if (sessionIn) {
         const sessionInMin = timeStrToMinutes_(sessionIn);
-        const lateThreshold = sd.startMin + 30; // Giờ bắt đầu ca + 30 phút
-        if (sessionInMin !== null && sessionInMin > lateThreshold) {
-          lateMinutes = sessionInMin - lateThreshold;
+        if (sessionInMin !== null && sd.startMin !== null) {
+          if (sessionInMin > sd.startMin) {
+            lateMinutes = sessionInMin - sd.startMin;
+          }
         }
       }
       out[sd.name] = {
@@ -677,32 +750,35 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
     return out;
   }
 
-  // LOGIC MỚI: Xử lý half-day split theo số mốc thời gian
-  // Định nghĩa các khoảng thời gian hợp lệ (linh hoạt hơn)
-  const MORNING_CHECKIN_EARLY = timeStrToMinutes_("06:00"); // Sớm nhất có thể check-in sáng
-  const MORNING_CHECKIN_LATE = timeStrToMinutes_("10:00"); // Muộn nhất có thể check-in sáng
-  const MORNING_CHECKOUT_EARLY = timeStrToMinutes_("10:00"); // Sớm nhất có thể check-out sáng
-  const MORNING_CHECKOUT_LATE = timeStrToMinutes_("13:30"); // Muộn nhất có thể check-out sáng
+  // LOGIC CẢI TIẾN: Xử lý half-day split theo số mốc thời gian
+  // Định nghĩa các khoảng thời gian hợp lệ dựa trên schedule thực tế của từng role
+  // Ca sáng: 8h30-12h (nhân viên) hoặc 9h00-12h (quản lý)
+  // Ca chiều: 13h15-16h45 (nhân viên) hoặc 13h15-17h15 (quản lý)
+  
+  const morningStartMin = timeStrToMinutes_(schedule.morning.start);
+  const morningEndMin = timeStrToMinutes_(schedule.morning.end);
+  const afternoonStartMin = timeStrToMinutes_(schedule.afternoon.start);
+  const afternoonEndMin = timeStrToMinutes_(schedule.afternoon.end);
+  
+  // Khoảng thời gian hợp lệ cho check-in/out (linh hoạt để xử lý các trường hợp edge case)
+  // Check-in sáng: từ 1.5 giờ trước giờ bắt đầu ca đến 1.5 giờ sau
+  const MORNING_CHECKIN_EARLY = Math.max(0, (morningStartMin || 510) - 90); // 90 phút trước
+  const MORNING_CHECKIN_LATE = (morningStartMin || 510) + 90; // 90 phút sau
+  // Check-out sáng: từ 2 giờ sau check-in đến 1.5 giờ sau giờ kết thúc ca
+  const MORNING_CHECKOUT_EARLY = (morningStartMin || 510) + 120; // Ít nhất 2 giờ sau check-in
+  const MORNING_CHECKOUT_LATE = (morningEndMin || 720) + 90; // 90 phút sau giờ kết thúc ca
 
-  const AFTERNOON_CHECKIN_EARLY = timeStrToMinutes_("12:00"); // Sớm nhất có thể check-in chiều
-  const AFTERNOON_CHECKIN_LATE = timeStrToMinutes_("15:00"); // Muộn nhất có thể check-in chiều
-  const AFTERNOON_CHECKOUT_EARLY = timeStrToMinutes_("15:00"); // Sớm nhất có thể check-out chiều
-  const AFTERNOON_CHECKOUT_LATE = timeStrToMinutes_("23:59"); // Muộn nhất có thể check-out chiều
-
-  // Khoảng thời gian lý tưởng (để ưu tiên)
-  const MORNING_CHECKIN_IDEAL_START = timeStrToMinutes_("07:30");
-  const MORNING_CHECKIN_IDEAL_END = timeStrToMinutes_("08:30");
-  const MORNING_CHECKOUT_IDEAL_START = timeStrToMinutes_("11:30");
-  const MORNING_CHECKOUT_IDEAL_END = timeStrToMinutes_("12:30");
-  const AFTERNOON_CHECKIN_IDEAL_START = timeStrToMinutes_("12:30");
-  const AFTERNOON_CHECKIN_IDEAL_END = timeStrToMinutes_("13:30");
-  const AFTERNOON_CHECKOUT_IDEAL_START = timeStrToMinutes_("16:30");
+  // Check-in chiều: từ sau giờ kết thúc ca sáng (hoặc từ 12:00) đến 1.5 giờ sau giờ bắt đầu ca chiều
+  // Cho phép check-in chiều sớm từ 12:00 để xử lý trường hợp check-out sáng muộn (12:07, 12:08...)
+  const AFTERNOON_CHECKIN_EARLY = Math.max((morningEndMin || 720), timeStrToMinutes_("12:00")); // Từ 12:00 hoặc sau giờ kết thúc ca sáng
+  const AFTERNOON_CHECKIN_LATE = (afternoonStartMin || 795) + 90; // 90 phút sau giờ bắt đầu ca chiều
+  // Check-out chiều: từ 2 giờ sau check-in đến 2 giờ sau giờ kết thúc ca
+  const AFTERNOON_CHECKOUT_EARLY = (afternoonStartMin || 795) + 120; // Ít nhất 2 giờ sau check-in
+  const AFTERNOON_CHECKOUT_LATE = (afternoonEndMin || 1005) + 120; // 2 giờ sau giờ kết thúc ca chiều
 
   // Tính hạn check-in trễ dựa trên schedule của từng role (giờ bắt đầu ca + 30 phút)
-  const morningStartMin = timeStrToMinutes_(schedule.morning.start);
-  const afternoonStartMin = timeStrToMinutes_(schedule.afternoon.start);
-  const MORNING_CHECKIN_LATE_THRESHOLD = morningStartMin !== null ? morningStartMin + 30 : timeStrToMinutes_("08:45"); // Giờ bắt đầu ca sáng + 30 phút
-  const AFTERNOON_CHECKIN_LATE_THRESHOLD = afternoonStartMin !== null ? afternoonStartMin + 30 : timeStrToMinutes_("14:00"); // Giờ bắt đầu ca chiều + 30 phút
+  const MORNING_CHECKIN_LATE_THRESHOLD = morningStartMin !== null ? morningStartMin + 30 : timeStrToMinutes_("09:00"); // Giờ bắt đầu ca sáng + 30 phút
+  const AFTERNOON_CHECKIN_LATE_THRESHOLD = afternoonStartMin !== null ? afternoonStartMin + 30 : timeStrToMinutes_("13:45"); // Giờ bắt đầu ca chiều + 30 phút
 
   // Khoảng cách tối thiểu giữa check-in và check-out (2 giờ)
   const MIN_SESSION_DURATION = 120; // 2 giờ
@@ -711,8 +787,7 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
   let afternoonIn = null, afternoonOut = null;
 
   const numTimes = timesSorted.length;
-  const hasMorning = registeredSessions && registeredSessions.has('morning');
-  const hasAfternoon = registeredSessions && registeredSessions.has('afternoon');
+  // Không cần check registeredSessions - phân tích hoàn toàn dựa trên thời gian
 
   // Helper function: Kiểm tra xem một thời gian có thể là check-in sáng không
   const couldBeMorningCheckIn = (tMin) => {
@@ -738,79 +813,52 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
     return tMin >= AFTERNOON_CHECKOUT_EARLY && tMin <= AFTERNOON_CHECKOUT_LATE;
   };
 
-  // XỬ LÝ THEO SỐ MỐC
+  // XỬ LÝ THEO SỐ MỐC - Logic cải tiến để xử lý chính xác hơn
+  // 1 ca = 2 mốc (in + out), 2 ca = 4 mốc (in sáng + out sáng + in chiều + out chiều)
+  
   if (numTimes === 2) {
-    // 2 mốc: Dựa vào đăng ký ca và thứ tự thời gian để xác định
+    // 2 mốc: Phân tích dựa trên thời gian để xác định là 1 ca (sáng hoặc chiều)
     const t1 = timesSorted[0];
     const t2 = timesSorted[1];
     const t1Min = timeStrToMinutes_(t1);
     const t2Min = timeStrToMinutes_(t2);
 
-    if (hasMorning && !hasAfternoon) {
-      // Chỉ đăng ký ca sáng: mốc 1 = check-in sáng, mốc 2 = check-out sáng
-      if (couldBeMorningCheckIn(t1Min)) {
-        morningIn = t1;
-      }
-      if (couldBeMorningCheckOut(t2Min) && t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
-        morningOut = t2;
-      }
-    } else if (!hasMorning && hasAfternoon) {
-      // Chỉ đăng ký ca chiều: mốc 1 = check-in chiều, mốc 2 = check-out chiều
-      if (couldBeAfternoonCheckIn(t1Min)) {
-        afternoonIn = t1;
-      }
-      if (couldBeAfternoonCheckOut(t2Min) && t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
-        afternoonOut = t2;
-      }
-    } else if (hasMorning && hasAfternoon) {
-      // Đăng ký cả 2 ca: Phân tích dựa trên thời gian
-      // Nếu cả 2 mốc đều có thể là ca sáng -> chỉ có ca sáng (thiếu ca chiều)
-      if (couldBeMorningCheckIn(t1Min) && couldBeMorningCheckOut(t2Min) &&
+    // Ưu tiên phân tích dựa trên khoảng thời gian hợp lệ
+    // Nếu cả 2 mốc đều nằm trong khoảng ca sáng -> 1 ca sáng (in + out)
+    if (couldBeMorningCheckIn(t1Min) && couldBeMorningCheckOut(t2Min) &&
         t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
-        morningIn = t1;
-        morningOut = t2;
-      }
-      // Nếu cả 2 mốc đều có thể là ca chiều -> chỉ có ca chiều (thiếu ca sáng)
-      else if (couldBeAfternoonCheckIn(t1Min) && couldBeAfternoonCheckOut(t2Min) &&
-        t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
-        afternoonIn = t1;
-        afternoonOut = t2;
-      }
-      // Nếu mốc 1 có thể là check-in sáng và mốc 2 có thể là check-out chiều
-      // (thiếu check-out sáng và check-in chiều)
-      else if (couldBeMorningCheckIn(t1Min) && couldBeAfternoonCheckOut(t2Min) &&
-        t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
-        morningIn = t1;
-        afternoonOut = t2;
-      }
-      // Nếu mốc 1 có thể là check-out sáng và mốc 2 có thể là check-out chiều
-      // (thiếu check-in sáng và check-in chiều)
-      else if (couldBeMorningCheckOut(t1Min) && couldBeAfternoonCheckOut(t2Min) &&
-        t2Min > (t1Min || 0)) {
-        morningOut = t1;
-        afternoonOut = t2;
-      }
-      // Nếu mốc 1 có thể là check-in sáng và mốc 2 có thể là check-in chiều
-      // (thiếu check-out sáng và check-out chiều)
-      else if (couldBeMorningCheckIn(t1Min) && couldBeAfternoonCheckIn(t2Min) &&
-        t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
-        morningIn = t1;
-        afternoonIn = t2;
-      }
-    } else {
-      // Không có đăng ký ca, phân tích dựa trên thời gian
-      if (couldBeMorningCheckIn(t1Min) && couldBeMorningCheckOut(t2Min) &&
-        t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
-        morningIn = t1;
-        morningOut = t2;
-      } else if (couldBeAfternoonCheckIn(t1Min) && couldBeAfternoonCheckOut(t2Min) &&
-        t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
-        afternoonIn = t1;
-        afternoonOut = t2;
-      }
+      morningIn = t1;
+      morningOut = t2;
+    }
+    // Nếu cả 2 mốc đều nằm trong khoảng ca chiều -> 1 ca chiều (in + out)
+    else if (couldBeAfternoonCheckIn(t1Min) && couldBeAfternoonCheckOut(t2Min) &&
+             t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
+      afternoonIn = t1;
+      afternoonOut = t2;
+    }
+    // Trường hợp đặc biệt: mốc 1 có thể là check-in sáng, mốc 2 là check-out chiều
+    // (thiếu check-out sáng và check-in chiều - làm cả 2 ca nhưng thiếu 2 mốc)
+    else if (couldBeMorningCheckIn(t1Min) && couldBeAfternoonCheckOut(t2Min) &&
+             t2Min > (t1Min || 0) + MIN_SESSION_DURATION * 2) {
+      morningIn = t1;
+      afternoonOut = t2;
+    }
+    // Trường hợp: mốc 1 là check-out sáng, mốc 2 là check-out chiều
+    // (thiếu check-in sáng và check-in chiều)
+    else if (couldBeMorningCheckOut(t1Min) && couldBeAfternoonCheckOut(t2Min) &&
+             t2Min > (t1Min || 0)) {
+      morningOut = t1;
+      afternoonOut = t2;
+    }
+    // Trường hợp: mốc 1 là check-in sáng, mốc 2 là check-in chiều
+    // (thiếu check-out sáng và check-out chiều)
+    else if (couldBeMorningCheckIn(t1Min) && couldBeAfternoonCheckIn(t2Min) &&
+             t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
+      morningIn = t1;
+      afternoonIn = t2;
     }
   } else if (numTimes === 4) {
-    // 4 mốc: mốc 1=check-in sáng, mốc 2=check-out sáng, mốc 3=check-in chiều, mốc 4=check-out chiều
+    // 4 mốc: Làm đủ 2 ca - mốc 1=check-in sáng, mốc 2=check-out sáng, mốc 3=check-in chiều, mốc 4=check-out chiều
     const t1 = timesSorted[0];
     const t2 = timesSorted[1];
     const t3 = timesSorted[2];
@@ -820,24 +868,29 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
     const t3Min = timeStrToMinutes_(t3);
     const t4Min = timeStrToMinutes_(t4);
 
-    // Mốc 1: check-in sáng
+    // Xác định chính xác từng mốc dựa trên khoảng thời gian hợp lệ
+    // Mốc 1: phải là check-in sáng
     if (couldBeMorningCheckIn(t1Min)) {
       morningIn = t1;
     }
-    // Mốc 2: check-out sáng (phải sau check-in sáng)
+    // Mốc 2: phải là check-out sáng (sau mốc 1 ít nhất 2 giờ)
     if (couldBeMorningCheckOut(t2Min) && t2Min > (t1Min || 0) + MIN_SESSION_DURATION) {
       morningOut = t2;
     }
-    // Mốc 3: check-in chiều (phải sau check-out sáng hoặc sau 12:00)
-    if (couldBeAfternoonCheckIn(t3Min) && t3Min > (t2Min || t1Min || 0)) {
+    // Mốc 3: phải là check-in chiều (sau mốc 2 - check-out sáng)
+    // Cho phép check-in chiều sớm từ 12:00 để xử lý trường hợp check-out sáng muộn (12:07, 12:08...)
+    if (couldBeAfternoonCheckIn(t3Min) && t3Min > (t2Min || 0)) {
       afternoonIn = t3;
     }
-    // Mốc 4: check-out chiều (phải sau check-in chiều)
+    // Mốc 4: phải là check-out chiều (sau mốc 3 ít nhất 2 giờ)
     if (couldBeAfternoonCheckOut(t4Min) && t4Min > (t3Min || 0) + MIN_SESSION_DURATION) {
       afternoonOut = t4;
     }
   } else if (numTimes === 3) {
     // 3 mốc: Phân tích logic để xác định quên check-out sáng hoặc quên check-in chiều
+    // Có thể là: in sáng + out sáng + in chiều (thiếu out chiều)
+    // Hoặc: in sáng + in chiều + out chiều (thiếu out sáng)
+    // Hoặc: in sáng + out sáng + out chiều (thiếu in chiều)
     const t1 = timesSorted[0];
     const t2 = timesSorted[1];
     const t3 = timesSorted[2];
@@ -853,9 +906,9 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
         // Mốc 2 là check-out sáng
         morningOut = t2;
         // Mốc 3 có thể là check-in hoặc check-out chiều
-        if (couldBeAfternoonCheckIn(t3Min) && t3Min > (t2Min || 0)) {
+        if (couldBeAfternoonCheckIn(t3Min) && t3Min > (t2Min || morningEndMin || 0)) {
           afternoonIn = t3;
-        } else if (couldBeAfternoonCheckOut(t3Min) && t3Min > (t2Min || 0)) {
+        } else if (couldBeAfternoonCheckOut(t3Min) && t3Min > (t2Min || morningEndMin || 0)) {
           afternoonOut = t3;
         }
       } else if (couldBeAfternoonCheckIn(t2Min) && t2Min > (t1Min || 0)) {
@@ -867,7 +920,10 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
       } else if (couldBeAfternoonCheckOut(t2Min) && t2Min > (t1Min || 0)) {
         // Mốc 2 là check-out chiều (quên check-out sáng và check-in chiều)
         afternoonOut = t2;
-        // Mốc 3 không hợp lệ
+        // Mốc 3 có thể là check-in chiều muộn
+        if (couldBeAfternoonCheckIn(t3Min) && t3Min < t2Min) {
+          afternoonIn = t3;
+        }
       }
     }
     // Pattern 2: check-in chiều, check-out chiều (quên cả ca sáng)
@@ -879,48 +935,40 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
         afternoonOut = t3;
       }
     }
+    // Pattern 3: check-out sáng, check-in chiều, check-out chiều (quên check-in sáng)
+    else if (couldBeMorningCheckOut(t1Min) && couldBeAfternoonCheckIn(t2Min) && couldBeAfternoonCheckOut(t3Min)) {
+      morningOut = t1;
+      afternoonIn = t2;
+      if (t3Min > (t2Min || 0) + MIN_SESSION_DURATION) {
+        afternoonOut = t3;
+      }
+    }
   } else if (numTimes === 1) {
-    // 1 mốc: Phân tích dựa trên thời gian và đăng ký ca
+    // 1 mốc: Phân tích dựa trên thời gian - chỉ có 1 mốc nên thiếu ít nhất 1 mốc
     const t1 = timesSorted[0];
     const t1Min = timeStrToMinutes_(t1);
 
     if (t1Min !== null) {
-      // Ưu tiên theo đăng ký ca
-      if (hasMorning && !hasAfternoon) {
-        if (couldBeMorningCheckIn(t1Min)) {
-          morningIn = t1;
-        } else if (couldBeMorningCheckOut(t1Min)) {
-          morningOut = t1;
-        }
-      } else if (!hasMorning && hasAfternoon) {
-        if (couldBeAfternoonCheckIn(t1Min)) {
-          afternoonIn = t1;
-        } else if (couldBeAfternoonCheckOut(t1Min)) {
-          afternoonOut = t1;
-        }
-      } else {
-        // Không có đăng ký ca hoặc có cả 2, phân tích dựa trên thời gian
-        if (couldBeMorningCheckIn(t1Min)) {
-          morningIn = t1;
-        } else if (couldBeMorningCheckOut(t1Min)) {
-          morningOut = t1;
-        } else if (couldBeAfternoonCheckIn(t1Min)) {
-          afternoonIn = t1;
-        } else if (couldBeAfternoonCheckOut(t1Min)) {
-          afternoonOut = t1;
-        }
+      // Phân tích dựa trên khoảng thời gian hợp lệ
+      if (couldBeMorningCheckIn(t1Min)) {
+        morningIn = t1;
+      } else if (couldBeMorningCheckOut(t1Min)) {
+        morningOut = t1;
+      } else if (couldBeAfternoonCheckIn(t1Min)) {
+        afternoonIn = t1;
+      } else if (couldBeAfternoonCheckOut(t1Min)) {
+        afternoonOut = t1;
       }
     }
   }
 
-  // Tính late minutes (chỉ tính check-in quá 30 phút)
+  // Tính late minutes: số phút trễ so với giờ bắt đầu ca
   let morningLateMinutes = 0;
   if (morningIn) {
     const morningInMin = timeStrToMinutes_(morningIn);
     if (morningInMin !== null && morningStartMin !== null) {
-      const lateThreshold = morningStartMin + 30; // Giờ bắt đầu ca sáng + 30 phút
-      if (morningInMin > lateThreshold) {
-        morningLateMinutes = morningInMin - lateThreshold;
+      if (morningInMin > morningStartMin) {
+        morningLateMinutes = morningInMin - morningStartMin;
       }
     }
   }
@@ -929,24 +977,53 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
   if (afternoonIn) {
     const afternoonInMin = timeStrToMinutes_(afternoonIn);
     if (afternoonInMin !== null && afternoonStartMin !== null) {
-      const lateThreshold = afternoonStartMin + 30; // Giờ bắt đầu ca chiều + 30 phút
-      if (afternoonInMin > lateThreshold) {
-        afternoonLateMinutes = afternoonInMin - lateThreshold;
+      if (afternoonInMin > afternoonStartMin) {
+        afternoonLateMinutes = afternoonInMin - afternoonStartMin;
       }
     }
   }
 
   // Phân loại times vào morning/afternoon để hiển thị
+  // Dựa vào kết quả phân tích thực tế thay vì chỉ dựa vào cutoffMin = 12:00
   const cutoffMin = timeStrToMinutes_("12:00");
   const morningTimes = [];
   const afternoonTimes = [];
+  
+  // Xác định ranh giới giữa ca sáng và ca chiều dựa trên kết quả phân tích
+  let morningEndBoundary = null;
+  let afternoonStartBoundary = null;
+  
+  if (morningOut) {
+    const morningOutMin = timeStrToMinutes_(morningOut);
+    if (morningOutMin !== null) {
+      morningEndBoundary = morningOutMin; // Tất cả mốc <= morningOut thuộc ca sáng
+    }
+  }
+  
+  if (afternoonIn) {
+    const afternoonInMin = timeStrToMinutes_(afternoonIn);
+    if (afternoonInMin !== null) {
+      afternoonStartBoundary = afternoonInMin; // Tất cả mốc >= afternoonIn thuộc ca chiều
+    }
+  }
+  
+  // Phân loại từng mốc thời gian
   for (const t of timesSorted) {
     const tMin = timeStrToMinutes_(t);
     if (tMin === null) continue;
-    if (tMin < cutoffMin) {
+    
+    // Nếu có ranh giới rõ ràng từ kết quả phân tích, dùng ranh giới đó
+    if (morningEndBoundary !== null && tMin <= morningEndBoundary) {
       morningTimes.push(t);
-    } else {
+    } else if (afternoonStartBoundary !== null && tMin >= afternoonStartBoundary) {
       afternoonTimes.push(t);
+    } else {
+      // Fallback: dựa vào cutoffMin = 12:00
+      if (tMin < cutoffMin) {
+        morningTimes.push(t);
+      } else {
+        afternoonTimes.push(t);
+      }
     }
   }
 
@@ -1128,6 +1205,80 @@ function prepareAttendanceChanges_(timesByEmpDay, masterInfo, cfg, month, schedu
 }
 
 /**
+ * Helper: phát hiện lỗi QUÊN CHECK IN/OUT cho 1 session (simple mode)
+ * Trả về: { notes: string[], offForgotDelta: number }
+ */
+function handleMissingCheckInOutSimple_(session, human, dayStr, month) {
+  const notes = [];
+  let offForgotDelta = 0;
+
+  // CHỈ báo lỗi khi session thực sự có làm (có ít nhất 1 mốc thời gian hợp lệ)
+  // Nếu session không có mốc thời gian nào (times.length === 0), coi như nhân viên không làm ca đó, không báo lỗi
+  const hasTimes = session && Array.isArray(session.times) && session.times.length > 0;
+  if (!hasTimes) {
+    return { notes, offForgotDelta }; // Không có mốc thời gian → không làm ca này → không báo lỗi
+  }
+
+  // Phát hiện lỗi quên check-in (chỉ khi có mốc thời gian nhưng thiếu check-in)
+  if (session.missingIn && session.in === null) {
+    notes.push(`- Quên check in ${human} ${dayStr}/${month}`);
+    offForgotDelta++;
+  }
+  // Phát hiện lỗi quên check-out (chỉ khi đã có check-in nhưng thiếu check-out)
+  else if (session.missingOut && session.in !== null && session.out === null) {
+    notes.push(`- Quên check out ${human} ${dayStr}/${month}`);
+    offForgotDelta++;
+  }
+
+  return { notes, offForgotDelta };
+}
+
+/**
+ * Helper: phát hiện lỗi TRỄ check-in cho 1 session (simple mode)
+ * - session.lateMinutes đã là số phút trễ so với giờ bắt đầu ca
+ * - >=30 phút: ghi "trễ trên 30 phút" và +1 vào lateCount, đồng thời đẩy vào problematicCells
+ * - <30 phút: ghi "trễ dưới 30 phút", không cộng vào lateCount
+ * Trả về: { notes: string[], lateDelta: number }
+ */
+function handleLateSimple_(session, human, dayStr, month, masterInfo, r0, emp, sessionName, problematicCells) {
+  const notes = [];
+  let lateDelta = 0;
+
+  if (session.in && session.lateMinutes && session.lateMinutes > 0) {
+    const lateMinutes = Math.round(session.lateMinutes);
+
+    if (session.lateMinutes >= 30) {
+      // Trễ trên 30 phút - ghi rõ và đếm vào lateCount
+      notes.push(`- Check in trễ trên 30 phút (${lateMinutes} phút) ${human} ${dayStr}/${month}`);
+      lateDelta++;
+
+      // Thêm vào problematicCells để highlight
+      const col1 = masterInfo.colByDay.get(dayStr);
+      if (col1) {
+        const c0 = col1 - masterInfo.minDayCol;
+        if (c0 >= 0 && c0 < masterInfo.dayColsCount) {
+          problematicCells.push({
+            r0,
+            c0,
+            emp,
+            dayStr,
+            type: 'late',
+            sessionName: sessionName,
+            lateMinutes: session.lateMinutes,
+            checkInTime: session.in
+          });
+        }
+      }
+    } else {
+      // Trễ dưới 30 phút - ghi rõ nhưng không đếm vào lateCount
+      notes.push(`- Check in trễ dưới 30 phút (${lateMinutes} phút) ${human} ${dayStr}/${month}`);
+    }
+  }
+
+  return { notes, lateDelta };
+}
+
+/**
  * Tính số ca off vân tay cho một nhân viên trong một khoảng ngày cụ thể (tuần)
  * Logic: 
  * - Nếu có check in nhưng quên check out = 1 ca off
@@ -1191,6 +1342,8 @@ function findHeaderCols_(headerRow) {
   headers.forEach((h, idx) => { if (h.n.includes("chi tiet")) detailIdx.push(idx + 1); });
   if (detailIdx.length) map.detail2Col = detailIdx[0];
   if (detailIdx.length > 1) map.detail3Col = detailIdx[1];
+  // lateNoteCol: ưu tiên Chi tiết(2) (thường là cột S) để ghi note TRỄ
+  map.lateNoteCol = map.detail2Col || null;
 
   // Tìm cột W cụ thể - cột có header "CHI TIẾT (3)" hoặc "chi tiet" và số "3"
   map.noteCol = null;
@@ -1261,17 +1414,16 @@ function findHeaderCols_(headerRow) {
   return map;
 }
 
-// Legacy summary-only helpers removed — use unified `applyAttendance({ useSchedule: false, dryRun, testRows })` instead.
-// For schedule-aware runs, use `applyAttendance({ useSchedule: true, ... })` or helpers `applyAttendanceWithScheduleTestWrite5()` / `applyAttendanceWithScheduleCommit()`.
+// Các hàm schedule-aware đã được xóa - chỉ sử dụng applyAttendance() với logic đơn giản (không cần schedule)
 
 /**
  * Highlight problematic cells (with too many check-ins and late check-ins) for review. 
- * Highlights ALL problematic cells in the sheet by checking ALL employees, not just those with OFF registration.
+ * Highlights ALL problematic cells in the sheet by checking ALL employees.
  * Checks for:
- * 1. Cells with >4 time stamps
- * 2. Cells with late check-in (more than 30 minutes after session start time based on role)
+ * 1. Cells with >4 time stamps (màu đỏ nhạt)
+ * 2. Cells with late check-in (màu đỏ) - tính toán chính xác theo role (quản lý vs nhân viên bình thường)
  */
-function highlightProblematicCells(useSchedule = false) {
+function highlightProblematicCells() {
   const MASTER_FILE_ID = "1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4";
   const MASTER_SHEET_NAME = "Chấm công th12/2025";
   const RAW_FILE_ID = "1ed1IK4X1bQxhBoz4tjUKEypIv6cipNKsUCcXPKjqy8o";
@@ -1373,37 +1525,95 @@ function highlightProblematicCells(useSchedule = false) {
 
   Logger.log(`4) Highlighting: ${tooManyTimesCells.length} cells with >4 times, ${lateCheckInCells.length} cells with late check-in`);
 
-  // Highlight cells với >4 mốc thời gian (màu đỏ nhạt)
-  tooManyTimesCells.forEach(p => {
-    const rowNum = p.r0 + 1;
-    const colNum = masterInfo.minDayCol + p.c0;
+  // Tối ưu: Batch highlight thay vì highlight từng cell để tránh timeout
+  // Gom các cells cùng màu lại và highlight cùng lúc
+  
+  // Highlight cells với >4 mốc thời gian (màu đỏ nhạt) - batch mode
+  if (tooManyTimesCells.length > 0) {
     try {
-      masterSh.getRange(rowNum, colNum).setBackground('#ffcccc');
-      Logger.log(`HIGHLIGHTED (>4 times) row=${rowNum} col=${colNum} emp=${p.emp} day=${p.dayStr} times=${p.timesCount}`);
+      // Gom các ranges lại nếu có thể, hoặc highlight từng batch nhỏ
+      const BATCH_SIZE = 20; // Highlight 20 cells mỗi lần
+      for (let i = 0; i < tooManyTimesCells.length; i += BATCH_SIZE) {
+        const batch = tooManyTimesCells.slice(i, i + BATCH_SIZE);
+        const ranges = batch.map(p => {
+          const rowNum = p.r0 + 1;
+          const colNum = masterInfo.minDayCol + p.c0;
+          return masterSh.getRange(rowNum, colNum);
+        });
+        
+        // Highlight tất cả cells trong batch cùng lúc
+        ranges.forEach((range, idx) => {
+          try {
+            range.setBackground('#ffcccc');
+            const p = batch[idx];
+            Logger.log(`HIGHLIGHTED (>4 times) row=${p.r0 + 1} col=${masterInfo.minDayCol + p.c0} emp=${p.emp} day=${p.dayStr} times=${p.timesCount}`);
+          } catch (e) {
+            Logger.log(`Failed to highlight cell in batch: ${e.message}`);
+          }
+        });
+        
+        // Flush sau mỗi batch để đảm bảo được ghi
+        SpreadsheetApp.flush();
+        
+        // Nghỉ ngắn giữa các batch để tránh rate limit
+        if (i + BATCH_SIZE < tooManyTimesCells.length) {
+          Utilities.sleep(50); // 50ms delay
+        }
+      }
     } catch (e) {
-      Logger.log(`Failed to highlight cell row=${rowNum} col=${colNum}: ${e.message}`);
+      Logger.log(`ERROR highlighting >4 times cells: ${e.message}`);
     }
-  });
+  }
 
-  // Highlight cells với check-in trễ (màu vàng)
-  lateCheckInCells.forEach(p => {
-    const rowNum = p.r0 + 1;
-    const colNum = masterInfo.minDayCol + p.c0;
+  // Highlight cells với check-in trễ (màu đỏ) - batch mode
+  if (lateCheckInCells.length > 0) {
     try {
-      masterSh.getRange(rowNum, colNum).setBackground('#fff4cc');
-      Logger.log(`HIGHLIGHTED (late check-in) row=${rowNum} col=${colNum} emp=${p.emp} day=${p.dayStr} session=${p.sessionName} late=${p.lateMinutes}min checkIn=${p.checkInTime}`);
+      const BATCH_SIZE = 20; // Highlight 20 cells mỗi lần
+      for (let i = 0; i < lateCheckInCells.length; i += BATCH_SIZE) {
+        const batch = lateCheckInCells.slice(i, i + BATCH_SIZE);
+        const ranges = batch.map(p => {
+          const rowNum = p.r0 + 1;
+          const colNum = masterInfo.minDayCol + p.c0;
+          return masterSh.getRange(rowNum, colNum);
+        });
+        
+        // Highlight tất cả cells trong batch cùng lúc
+        ranges.forEach((range, idx) => {
+          try {
+            range.setBackground('#ff0000');
+            const p = batch[idx];
+            Logger.log(`HIGHLIGHTED (late check-in) row=${p.r0 + 1} col=${masterInfo.minDayCol + p.c0} emp=${p.emp} day=${p.dayStr} session=${p.sessionName} late=${p.lateMinutes}min checkIn=${p.checkInTime}`);
+          } catch (e) {
+            Logger.log(`Failed to highlight cell in batch: ${e.message}`);
+          }
+        });
+        
+        // Flush sau mỗi batch
+        SpreadsheetApp.flush();
+        
+        // Nghỉ ngắn giữa các batch
+        if (i + BATCH_SIZE < lateCheckInCells.length) {
+          Utilities.sleep(50); // 50ms delay
+        }
+      }
     } catch (e) {
-      Logger.log(`Failed to highlight cell row=${rowNum} col=${colNum}: ${e.message}`);
+      Logger.log(`ERROR highlighting late check-in cells: ${e.message}`);
     }
-  });
+  }
 
   Logger.log(`5) Completed highlighting ${problematicCells.length} problematic cells (${tooManyTimesCells.length} >4 times, ${lateCheckInCells.length} late check-in)`);
 
+  // Final flush để đảm bảo tất cả highlight được ghi
+  SpreadsheetApp.flush();
+  
+  // Hiển thị thông báo bằng toast (không chặn execution)
   try {
-    const ui = SpreadsheetApp.getUi();
-    ui.alert(`Hoàn thành! Đã highlight ${problematicCells.length} ô bất thường:\n- ${tooManyTimesCells.length} ô có >4 mốc thời gian\n- ${lateCheckInCells.length} ô có check-in trễ`);
+    const message = `Đã highlight ${problematicCells.length} ô:\n- ${tooManyTimesCells.length} ô >4 mốc\n- ${lateCheckInCells.length} ô trễ`;
+    masterSh.getRange(1, 1).setValue(masterSh.getRange(1, 1).getValue()); // Trigger refresh
+    SpreadsheetApp.getActiveSpreadsheet().toast(message, "Hoàn thành", 5);
+    Logger.log(`Toast notification: ${message}`);
   } catch (e) {
-    Logger.log(`Alert skipped (no UI available)`);
+    Logger.log(`Notification skipped. Completed: ${problematicCells.length} cells highlighted.`);
   }
 }
 
@@ -1968,118 +2178,217 @@ function prepareAttendanceChangesWithSchedule_(timesByEmpDay, masterInfo, schedu
 }
 
 /**
- * Preview attendance check using schedule registrations and raw logs. Safe dry-run only.
+ * Xử lý chấm công đơn giản - chỉ dựa vào raw data, không cần đăng ký ca
+ * Phân tích trực tiếp từ times để phát hiện lỗi: TRỄ, QUÊN IN/OUT.
+ * Có thể chạy theo 3 mode:
+ *  - 'both'   : xử lý cả TRỄ và QUÊN IN/OUT (mặc định, giống logic cũ)
+ *  - 'late'   : chỉ xử lý TRỄ (bỏ qua hoàn toàn lỗi quên check in/out)
+ *  - 'missing': chỉ xử lý QUÊN check in/out (bỏ qua hoàn toàn lỗi trễ)
+ * @param {Map} timesByEmpDay - Map<empCode, Map<dayStr, Set<times>>>
+ * @param {Object} masterInfo - Thông tin master sheet
+ * @param {Object} cfg - Config (morningStart, afternoonStart, cutoff, lateThreshold)
+ * @param {number} month - Tháng
+ * @param {string} mode - 'both' | 'late' | 'missing'
+ * @return {Object} { changes: Map<r0, {notes, lateCount, offForgotCount}>, problematicCells: Array }
  */
-function previewAttendanceWithSchedule() {
-  const SCHEDULE_FILE_ID = '1oKFAsC-mhAtA_yzHk8TwC3k5cCYzdNKFTgYSxfbDsSo';
-  const SCHEDULE_SHEETS = ['LỊCH LÀM T12/2025', 'PAGE LỄ TÂN - LỊCH LÀM 2025'];
-  const MASTER_EMP_FILE_ID = '1_szrWl2X-6Kcp7lpdl4HmBo7uciLqDGO-VWq1uie3HY';
-  const MASTER_EMP_SHEET = 'MÃ SỐ NHÂN VIÊN';
-  const MASTER_FILE_ID = '1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4';
-  const MASTER_SHEET_NAME = 'Chấm công th12/2025';
+function prepareAttendanceChangesSimple_(timesByEmpDay, masterInfo, cfg, month, mode) {
+  const changes = new Map();
+  const problematicCells = [];
+  const normalizedMode = (String(mode || 'both').toLowerCase());
+  const runLate = (normalizedMode === 'both' || normalizedMode === 'late');
+  const runMissing = (normalizedMode === 'both' || normalizedMode === 'missing');
 
-  const RAW_FILE_ID = '1ed1IK4X1bQxhBoz4tjUKEypIv6cipNKsUCcXPKjqy8o';
-  const RAW_SHEETS = ['L4_HH'];
-  const cfg = { morningStart: '08:30', afternoonStart: '13:15', cutoff: '12:00', lateThreshold: 30 };
-  const month = parseMonthFromSheetName_(MASTER_SHEET_NAME) || 12;
+  // helper to convert session name to human
+  const humanForSession = (sess) => {
+    if (!sess) return 'ca';
+    if (sess === 'morning') return 'ca sáng';
+    if (sess === 'afternoon') return 'ca chiều';
+    if (sess === 'evening') return 'ca tối';
+    return 'ca';
+  };
 
-  // name -> code map
-  const nameMap = buildNameToEmpMap_(MASTER_EMP_FILE_ID, MASTER_EMP_SHEET);
-  Logger.log('Built nameMap size=' + nameMap.size);
+  // Duyệt qua TẤT CẢ nhân viên có dữ liệu trong raw data (không cần schedule)
+  for (const [emp, dayMap] of timesByEmpDay.entries()) {
+    // YÊU CẦU: Bỏ qua hoàn toàn nhân viên MH0008 (không xử lý trễ, không quên in/out)
+    const empId = String(emp || '').toUpperCase();
+    if (empId === 'MH0008') continue;
 
-  // load schedule registrations
-  const scheduleMap = loadScheduleRegistrations_(SCHEDULE_FILE_ID, SCHEDULE_SHEETS, nameMap);
-  Logger.log('Loaded scheduleMap entries=' + scheduleMap.size);
+    const r1 = masterInfo.empToRow.get(emp);
+    if (!r1) continue; // employee not in master attendance sheet
+    const r0 = r1 - 1;
 
-  // build times and master info
-  const timesByEmpDay = buildTimesFromRawSheets_(RAW_FILE_ID, RAW_SHEETS);
-  const masterSh = SpreadsheetApp.openById(MASTER_FILE_ID).getSheetByName(MASTER_SHEET_NAME);
-  const masterInfo = buildMasterInfo_(masterSh, 2, 1);
+    let notesForDetail = [];
+    let lateCount = 0, offForgotCount = 0;
 
-  const result = prepareAttendanceChangesWithSchedule_(timesByEmpDay, masterInfo, scheduleMap, cfg, month);
-  const changes = result.changes;
+    // Lấy schedule template dựa trên role (chỉ để tính lateMinutes, không dùng để check đăng ký ca)
+    const role = masterInfo.empToRole ? masterInfo.empToRole.get(emp) : undefined;
+    const scheduleTemplate = getEmployeeSchedule_(emp, cfg, role);
 
-  Logger.log('Preview changes (schedule-aware) count=' + changes.size);
-  let i = 0;
-  for (const [r0, v] of changes.entries()) {
-    Logger.log(`Row ${r0 + 1}: ${v.notes.join('; ')}`);
-    if (++i >= 50) break;
+    // Duyệt qua TẤT CẢ các ngày có dữ liệu trong raw data
+    for (const [dayStr, timesSet] of dayMap.entries()) {
+      const timesArr = Array.from(timesSet);
+
+      // Nếu không có times trong raw, thử lấy từ master sheet
+      if ((!timesArr || timesArr.length === 0) && masterInfo) {
+        const col1 = masterInfo.colByDay.get(dayStr);
+        if (col1) {
+          const c0 = col1 - masterInfo.minDayCol;
+          const existing = masterInfo.dayBlock[r0][c0];
+          const extracted = extractTimesFromCell_(existing);
+          if (extracted && extracted.length) {
+            timesArr.push(...extracted);
+          }
+        }
+      }
+
+      if (!timesArr || timesArr.length === 0) {
+        // Không có dữ liệu - bỏ qua (không tính vắng, không check schedule)
+        continue;
+      }
+
+      // Check if too many check-ins/outs in a single cell
+      const threshold = cfg.maxTimesThreshold || 4;
+      if (timesArr && timesArr.length > threshold) {
+        const col1 = masterInfo.colByDay.get(dayStr);
+        if (col1) {
+          const c0 = col1 - masterInfo.minDayCol;
+          if (c0 >= 0 && c0 < masterInfo.dayColsCount) {
+            problematicCells.push({
+              r0,
+              c0,
+              emp,
+              dayStr,
+              type: 'tooManyTimes',
+              timesCount: timesArr.length
+            });
+            Logger.log(`SKIP cell r=${r0 + 1} c=${c0 + masterInfo.minDayCol} emp=${emp} day=${dayStr} times=${timesArr.length} (> ${threshold})`);
+          }
+        }
+        // Không bỏ qua cell này nữa, vẫn tiếp tục phân tích để không sót lỗi
+      }
+
+      // Phân tích times để xác định check-in/out (KHÔNG cần registeredSessions)
+      // Truyền null cho registeredSessions để hàm tự phân tích dựa trên thời gian
+      const sessionsMap = computeSessionsBySchedule_(timesArr, scheduleTemplate, null);
+
+      // Kiểm tra tất cả sessions được phát hiện (morning, afternoon)
+      for (const [sessionName, session] of Object.entries(sessionsMap)) {
+        // Bỏ qua các session không hợp lệ
+        if (sessionName === '_problematic' || sessionName === '_timesCount') continue;
+
+        // Với chế độ đơn giản (không có đăng ký ca), nếu session không có bất kỳ mốc giờ nào
+        // thì coi như nhân sự KHÔNG LÀM ca đó, không ghi lỗi quên check in/out
+        if (!session || !Array.isArray(session.times) || session.times.length === 0) {
+          continue;
+        }
+
+        const human = humanForSession(sessionName);
+
+        // 1) Xử lý QUÊN CHECK IN/OUT (tùy theo mode)
+        if (runMissing) {
+          const missingRes = handleMissingCheckInOutSimple_(session, human, dayStr, month);
+          if (missingRes.notes.length) {
+            notesForDetail.push(...missingRes.notes);
+            offForgotCount += missingRes.offForgotDelta;
+          }
+        }
+
+        // 2) Xử lý TRỄ CHECK-IN (tùy theo mode)
+        if (runLate) {
+          const lateRes = handleLateSimple_(session, human, dayStr, month, masterInfo, r0, emp, sessionName, problematicCells);
+          if (lateRes.notes.length) {
+            notesForDetail.push(...lateRes.notes);
+            lateCount += lateRes.lateDelta;
+          }
+        }
+      }
+    }
+
+    if (notesForDetail.length) {
+      changes.set(r0, { notes: notesForDetail, lateCount, offForgotCount });
+    }
   }
+
+  return { changes, problematicCells };
 }
 
-/**
- * Apply schedule-aware attendance checks: writes notes into detail column(s) like previous functions
- * Call with dryRun = true for preview, false to commit
- */
-function applyAttendanceWithSchedule(dryRun = true) {
-  Logger.log('DEPRECATED: applyAttendanceWithSchedule called. Delegating to applyAttendance(useSchedule=true)');
-  return applyAttendance({ useSchedule: true, dryRun });
-}
+// Các hàm schedule-aware đã được xóa vì không còn cần thiết
+// Sử dụng applyAttendance() với useSchedule=false (mặc định) để xử lý chỉ dựa vào raw data
 
 /**
- * Unified apply function for attendance summary or schedule-aware checks.
+ * Unified apply function for attendance checks - chỉ dựa vào raw data, không cần schedule
  * Options:
- *  - useSchedule: boolean (true = use schedule registrations OFF to check; false = summary-only)
  *  - dryRun: boolean (true = preview only)
  *  - testRows: number|null (if set >0, will write only N changed rows for safe testing)
+ *  - mode: 'both' | 'late' | 'missing'
  */
 function applyAttendance(opts) {
   opts = opts || {};
-  const useSchedule = typeof opts.useSchedule === 'boolean' ? opts.useSchedule : true;
-  const dryRun = typeof opts.dryRun === 'boolean' ? opts.dryRun : true;
+  // Mặc định: chạy commit (dryRun=false) để ghi thẳng vào sheet nếu không truyền opts.dryRun
+  const dryRun = typeof opts.dryRun === 'boolean' ? opts.dryRun : false;
   const testRows = (typeof opts.testRows === 'number' && opts.testRows > 0) ? Math.trunc(opts.testRows) : null;
 
-  // Backward-compatible wrappers (small helpers made available in run dropdown)
-
-  const SCHEDULE_FILE_ID = '1oKFAsC-mhAtA_yzHk8TwC3k5cCYzdNKFTgYSxfbDsSo';
-  const SCHEDULE_SHEETS = ['LỊCH LÀM T12/2025', 'PAGE LỄ TÂN - LỊCH LÀM 2025'];
-  const MASTER_EMP_FILE_ID = '1_szrWl2X-6Kcp7lpdl4HmBo7uciLqDGO-VWq1uie3HY';
-  const MASTER_EMP_SHEET = 'MÃ SỐ NHÂN VIÊN';
   const MASTER_FILE_ID = '1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4';
   const MASTER_SHEET_NAME = 'Chấm công th12/2025';
 
   const RAW_FILE_ID = '1ed1IK4X1bQxhBoz4tjUKEypIv6cipNKsUCcXPKjqy8o';
   const RAW_SHEETS = ['L4_HH'];
-  const cfg = { morningStart: '08:30', afternoonStart: '13:15', cutoff: '12:00', lateThreshold: 30 };
+  const cfg = { morningStart: '08:30', afternoonStart: '13:15', cutoff: '12:00', lateThreshold: 30, maxTimesThreshold: 4 };
 
-  // load resources
-  // QUAN TRỌNG: Chỉ load và kiểm tra những người có đăng ký OFF (đi làm tại công ty)
-  // Không kiểm tra những người không có trong sheet đăng ký ca hoặc không đăng ký OFF
-  let nameMap = buildNameToEmpMap_(MASTER_EMP_FILE_ID, MASTER_EMP_SHEET);
-  // Luôn chỉ load OFF (không load tất cả các ca đăng ký)
-  const scheduleMap = loadScheduleRegistrations_(SCHEDULE_FILE_ID, SCHEDULE_SHEETS, nameMap);
-  Logger.log('applyAttendance: scheduleMap entries (OFF only)=' + (scheduleMap ? scheduleMap.size : 0));
-
+  // Load raw data
+  Logger.log('1) Loading raw data from sheets...');
   const timesByEmpDay = buildTimesFromRawSheets_(RAW_FILE_ID, RAW_SHEETS);
+  Logger.log('   Loaded times for ' + timesByEmpDay.size + ' employees');
+
+  // Load master sheet info
+  Logger.log('2) Loading master sheet info...');
   const masterSh = SpreadsheetApp.openById(MASTER_FILE_ID).getSheetByName(MASTER_SHEET_NAME);
   const masterInfo = buildMasterInfo_(masterSh, 2, 1);
   const month = parseMonthFromSheetName_(MASTER_SHEET_NAME) || 12;
   const headerMap = findHeaderCols_(masterInfo.header);
 
-  // compute changes - luôn dùng prepareAttendanceChangesWithSchedule_ để chỉ kiểm tra OFF
-  const result = prepareAttendanceChangesWithSchedule_(timesByEmpDay, masterInfo, scheduleMap, cfg, month);
+  // Compute changes - chỉ dựa vào raw data, không cần schedule
+  Logger.log('3) Analyzing attendance (simple mode - no schedule check)...');
+  const mode = opts.mode || 'both'; // 'both' | 'late' | 'missing'
+  const result = prepareAttendanceChangesSimple_(timesByEmpDay, masterInfo, cfg, month, mode);
+
   const changes = result.changes || new Map();
   const problematicCells = result.problematicCells || [];
 
-  Logger.log('applyAttendance: computed changes=' + changes.size + ' problematic=' + problematicCells.length + ' useSchedule=' + useSchedule);
+  Logger.log('   Computed changes=' + changes.size + ' problematic=' + problematicCells.length);
 
   // prepare arrays for writing
   const lastEmpRow = masterInfo.lastEmpRow;
-  // Sử dụng noteCol (cột W) thay vì detail2Col (cột M) để ghi note
-  const noteCol = headerMap.noteCol || headerMap.detail2Col; // Fallback về detail2Col nếu không tìm thấy noteCol
+  // Ghi note:
+  //  - lateNoteCol (thường là cột S / Chi tiết(2)) cho các note TRỄ
+  //  - noteCol (cột W / Chi tiết(3)) cho các note QUÊN CHECK IN/OUT
+  const noteCol = headerMap.noteCol || headerMap.detail3Col || headerMap.detail2Col;
+  const lateNoteCol = headerMap.detail2Col || null;
   const noteArr = noteCol ? masterSh.getRange(1, noteCol, lastEmpRow, 1).getValues().map(r => r[0]) : [];
+  const lateNoteArr = lateNoteCol ? masterSh.getRange(1, lateNoteCol, lastEmpRow, 1).getValues().map(r => r[0]) : [];
   const totalLateArr = headerMap.totalLateCol ? masterSh.getRange(1, headerMap.totalLateCol, lastEmpRow, 1).getValues().map(r => r[0]) : [];
   const offForgotArr = headerMap.offForgotCol ? masterSh.getRange(1, headerMap.offForgotCol, lastEmpRow, 1).getValues().map(r => r[0]) : [];
 
   const newNote = noteArr.slice();
+  const newLateNote = lateNoteArr.slice();
   const newTotalLate = totalLateArr.slice();
   const newOffForgot = offForgotArr.slice();
 
   // apply changes into arrays
   for (const [r0, v] of changes.entries()) {
-    if (noteCol) {
+    const allNotes = v.notes || [];
+    const lateNotes = allNotes.filter(n => typeof n === 'string' && n.toLowerCase().includes('trễ'));
+    const missingNotes = allNotes.filter(n => typeof n === 'string' && n.toLowerCase().includes('quên check'));
+
+    // Ghi note TRỄ vào cột S (lateNoteCol)
+    if (lateNoteCol && lateNotes.length) {
+      const prevLate = String(newLateNote[r0] || '').trim();
+      newLateNote[r0] = (prevLate ? prevLate + '\n' : '') + lateNotes.join('\n');
+    }
+    // Ghi note QUÊN CHECK IN/OUT vào cột W (noteCol)
+    if (noteCol && missingNotes.length) {
       const prev = String(newNote[r0] || '').trim();
-      newNote[r0] = (prev ? prev + '\n' : '') + v.notes.join('\n');
+      newNote[r0] = (prev ? prev + '\n' : '') + missingNotes.join('\n');
     }
     if (headerMap.totalLateCol) {
       const prev = Number(newTotalLate[r0] || 0);
@@ -2125,8 +2434,10 @@ function applyAttendance(opts) {
 
   // otherwise full commit: write columns back
   const writes = [];
-  const noteColToWrite = headerMap.noteCol || headerMap.detail2Col;
+  const noteColToWrite = headerMap.noteCol || headerMap.detail3Col || headerMap.detail2Col;
+  const lateNoteColToWrite = headerMap.detail2Col || null;
   if (noteColToWrite) writes.push({ range: masterSh.getRange(1, noteColToWrite, lastEmpRow, 1), values: newNote.map(x => [x || '']) });
+  if (lateNoteColToWrite) writes.push({ range: masterSh.getRange(1, lateNoteColToWrite, lastEmpRow, 1), values: newLateNote.map(x => [x || '']) });
   if (headerMap.totalLateCol) writes.push({ range: masterSh.getRange(1, headerMap.totalLateCol, lastEmpRow, 1), values: newTotalLate.map(x => [x || 0]) });
   if (headerMap.offForgotCol) writes.push({ range: masterSh.getRange(1, headerMap.offForgotCol, lastEmpRow, 1), values: newOffForgot.map(x => [x || 0]) });
   // Bỏ xử lý onlForgotCol - không sử dụng nữa
@@ -2136,17 +2447,27 @@ function applyAttendance(opts) {
   return { changesCount: changes.size, written: writes.length };
 }
 
-// Small helper to run a safe test write (first 5 changed rows) for schedule-aware flow
-function applyAttendanceWithScheduleTestWrite5() {
-  Logger.log('Running safe test-write: applyAttendance(useSchedule=true, dryRun=false, testRows=5)');
-  return applyAttendance({ useSchedule: true, dryRun: false, testRows: 5 });
+/**
+ * Wrapper: chỉ chạy phần TRỄ (late) – không ghi/quét lỗi quên check in/out.
+ * Có thể gán hàm này vào 1 nút/menu riêng.
+ */
+function applyAttendanceLateOnly(opts) {
+  opts = opts || {};
+  opts.mode = 'late';
+  return applyAttendance(opts);
 }
 
-// Helper to commit full run for schedule-aware flow
-function applyAttendanceWithScheduleCommit() {
-  Logger.log('Running full commit: applyAttendance(useSchedule=true, dryRun=false)');
-  return applyAttendance({ useSchedule: true, dryRun: false });
+/**
+ * Wrapper: chỉ chạy phần QUÊN CHECK IN/OUT – không xử lý TRỄ.
+ * Có thể gán hàm này vào 1 nút/menu riêng.
+ */
+function applyAttendanceMissingOnly(opts) {
+  opts = opts || {};
+  opts.mode = 'missing';
+  return applyAttendance(opts);
 }
+
+// Các hàm schedule-aware đã được xóa vì không còn cần thiết
 
 /**
  * Tính toán và cập nhật các cột BP-BT "Vân tay tuần" với số ca off vân tay theo từng tuần
@@ -2911,10 +3232,10 @@ function writeOnlCheckInOutToMaster_(masterFileId, masterSheetName, formData, na
   const masterSh = ss.getSheetByName(masterSheetName);
   if (!masterSh) throw new Error('Không tìm thấy sheet tổng: ' + masterSheetName);
 
-  // Tìm cột DO (cột 120) đến ES (cột 145) - tương ứng với ngày 1-onl đến 26-onl
-  // Cột DO = 120, ES = 145 (26 cột)
-  const onlStartCol = 120; // DO
-  const onlEndCol = 145; // ES
+  // Tìm cột DO (cột 119) đến ES (cột 149) - tương ứng với ngày 1-onl đến 31-onl
+  // Cột DO = 119, ES = 149 (31 cột)
+  const onlStartCol = 119; // DO
+  const onlEndCol = 149; // ES
   const onlColCount = onlEndCol - onlStartCol + 1;
 
   // Đọc header để map ngày -> cột
@@ -2987,6 +3308,12 @@ function writeOnlCheckInOutToMaster_(masterFileId, masterSheetName, formData, na
     const row1 = masterInfo.empToRow.get(empCode);
     if (!row1) {
       Logger.log(`Warning: Không tìm thấy nhân viên ${empCode} trong sheet tổng`);
+      continue;
+    }
+
+    // Bỏ qua hàng 1 (header) - chỉ xử lý từ hàng 2 trở đi
+    if (row1 === 1) {
+      Logger.log(`Warning: Skipping row 1 (header) for emp ${empCode}`);
       continue;
     }
 
@@ -3209,7 +3536,7 @@ function processOnlCheckInOutCommit() {
 function debugOnlCell(empCode, dayStr) {
   const MASTER_FILE_ID = '1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4';
   const MASTER_SHEET_NAME = 'Chấm công th12/2025';
-  const onlStartCol = 120; // DO
+  const onlStartCol = 119; // DO
 
   const ss = SpreadsheetApp.openById(MASTER_FILE_ID);
   const masterSh = ss.getSheetByName(MASTER_SHEET_NAME);
@@ -3219,7 +3546,7 @@ function debugOnlCell(empCode, dayStr) {
   }
 
   // Tìm cột cho ngày
-  const header = masterSh.getRange(1, onlStartCol, 1, 26).getValues()[0];
+  const header = masterSh.getRange(1, onlStartCol, 1, 31).getValues()[0];
   let colIndex = null;
   for (let c = 0; c < header.length; c++) {
     const headerVal = String(header[c] || '').trim();
@@ -3258,3 +3585,549 @@ function debugOnlCell(empCode, dayStr) {
   Logger.log(`URL: https://docs.google.com/spreadsheets/d/${MASTER_FILE_ID}/edit#gid=${masterSh.getSheetId()}&range=${colLetter}${row1}`);
 }
 
+/**
+ * IMPORT GOOGLE FORM CHẤM CÔNG ONLINE -> SHEET TỔNG (Cột DO -> ES)
+ * Xử lý CA ONLINE: fill vào cột DO -> ES với format "onl ca sáng", "onl ca chiều", "onl 2 ca"
+ */
+function importOnlineFormToMaster() {
+  // ====== CONFIG ======
+  const FORM_FILE_ID = "1GATYUk6jMyNIRyDI1FxH-I9ix6NafyE3PwJn2ptHJ1k"; // File chứa form responses
+  const FORM_SHEET_NAME = "Form Responses 1";
+  
+  const MASTER_FILE_ID = "1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4";
+  const MASTER_SHEET_NAME = "Chấm công th12/2025";
+  
+  const MASTER_EMP_COL = 2;     // cột mã nhân viên (B)
+  const MASTER_HEADER_ROW = 1;  // hàng chứa số ngày 1..31
+  const ONLINE_START_COL = 119; // Cột DO (119 = DO)
+  const ONLINE_END_COL = 149;   // Cột ES (149 = ES) = 31 cột
+  
+  // Mapping cột trong form responses (0-based index)
+  const FORM_COL_TIMESTAMP = 0;      // A: Dấu thời gian
+  const FORM_COL_EMAIL = 1;           // B: Email
+  const FORM_COL_EMP_CODE = 2;        // C: Mã nhân viên (đã sửa từ D sang C)
+  const FORM_COL_NAME = 3;            // D: Họ và tên
+  const FORM_COL_TEAM = 4;            // E: Team
+  const FORM_COL_DATE = 5;            // F: Ngày chấm công
+  const FORM_COL_SHIFT = 6;           // G: Ca làm việc
+  const FORM_COL_PROOF = 7;           // H: Minh chứng
+  const FORM_COL_TYPE = 9;            // J: EM CHẤM CÔNG CHO HÌNH THỨC (CA ONLINE / CA OFFLINE - CƠ SỞ KHÁC)
+  const FORM_COL_WORK_TYPE = 8;       // I: Hình thức làm việc (Parttime/Fulltime/Online)
+  
+  Logger.log("1) Opening form responses sheet...");
+  const formSS = SpreadsheetApp.openById(FORM_FILE_ID);
+  const formSh = formSS.getSheetByName(FORM_SHEET_NAME);
+  if (!formSh) throw new Error("Không tìm thấy sheet form: " + FORM_SHEET_NAME);
+  
+  const formValues = formSh.getDataRange().getValues();
+  Logger.log(`   Loaded ${formValues.length} rows from form`);
+  
+  // Debug: Log tất cả header để xem cấu trúc form
+  if (formValues.length > 0) {
+    const headerRow = formValues[0];
+    Logger.log(`   Debug: All headers (${headerRow.length} columns):`);
+    for (let c = 0; c < headerRow.length; c++) {
+      Logger.log(`     Col ${c}: "${headerRow[c]}"`);
+    }
+  }
+  
+  // Tự động tìm cột TYPE từ header row (row 0)
+  // Cột TYPE là cột J với header "EM CHẤM CÔNG CHO HÌNH THỨC:"
+  let actualTypeCol = FORM_COL_TYPE;
+  let foundTypeCol = false;
+  if (formValues.length > 0) {
+    const headerRow = formValues[0];
+    for (let c = 0; c < headerRow.length; c++) {
+      const headerText = String(headerRow[c] || "").toLowerCase().trim();
+      // Tìm cột có chứa "em chấm công cho hình thức" hoặc "hình thức"
+      if (headerText.includes("em chấm công cho hình thức") || 
+          headerText.includes("chấm công cho hình thức") ||
+          (headerText.includes("hình thức") && headerText.includes("chấm công"))) {
+        actualTypeCol = c;
+        foundTypeCol = true;
+        Logger.log(`   Found TYPE column at index ${c} (header: "${headerRow[c]}")`);
+        break;
+      }
+    }
+    // Nếu không tìm thấy, thử tìm bằng "ca online" hoặc "ca offline" nhưng KHÔNG phải "minh chứng"
+    if (!foundTypeCol) {
+      for (let c = 0; c < headerRow.length; c++) {
+        const headerText = String(headerRow[c] || "").toLowerCase().trim();
+        if ((headerText.includes("ca online") || headerText.includes("ca offline")) &&
+            !headerText.includes("minh chứng") && !headerText.includes("minh chung") &&
+            !headerText.includes("proof") && !headerText.includes("drive")) {
+          actualTypeCol = c;
+          foundTypeCol = true;
+          Logger.log(`   Found TYPE column at index ${c} (header: "${headerRow[c]}") by 'online/offline' keyword`);
+          break;
+        }
+      }
+    }
+    if (!foundTypeCol) {
+      Logger.log(`   WARNING: Could not find TYPE column automatically, using default index ${FORM_COL_TYPE} (column J)`);
+    }
+  }
+  
+  // Tự động tìm cột EMP_CODE từ header row
+  let actualEmpCol = FORM_COL_EMP_CODE;
+  if (formValues.length > 0) {
+    const headerRow = formValues[0];
+    for (let c = 0; c < headerRow.length; c++) {
+      const headerText = String(headerRow[c] || "").toLowerCase().trim();
+      if (headerText.includes("mã nhân viên") || headerText.includes("ma nhan vien") ||
+          headerText.includes("employee") || headerText.includes("code")) {
+        actualEmpCol = c;
+        Logger.log(`   Found EMP_CODE column at index ${c} (header: "${headerRow[c]}")`);
+        break;
+      }
+    }
+  }
+  
+  // Tự động tìm cột SHIFT từ header row
+  let actualShiftCol = FORM_COL_SHIFT;
+  if (formValues.length > 0) {
+    const headerRow = formValues[0];
+    for (let c = 0; c < headerRow.length; c++) {
+      const headerText = String(headerRow[c] || "").toLowerCase().trim();
+      if (headerText.includes("ca làm việc") || headerText.includes("ca lam viec") ||
+          headerText.includes("shift") || headerText.includes("ca sáng") || 
+          headerText.includes("ca chiều") || headerText.includes("ca sang") ||
+          headerText.includes("ca chieu")) {
+        actualShiftCol = c;
+        Logger.log(`   Found SHIFT column at index ${c} (header: "${headerRow[c]}")`);
+        break;
+      }
+    }
+  }
+  
+  // ====== 2) PARSE FORM DATA - CHỈ LẤY CA ONLINE VÀ THÁNG 12/2025 ======
+  Logger.log("2) Parsing form data (CA ONLINE only, month 12/2025)...");
+  // Map: empCode -> Map<dayStr, {morning: {in, out}, afternoon: {in, out}}>
+  const onlineByEmpDay = new Map();
+  // Mã nhân viên có thể là MHxxxx, LL082, HN045, etc. - không giới hạn format
+  // Nới lỏng regex: cho phép chữ cái, số, và một số ký tự đặc biệt thường gặp
+  // Loại bỏ các ký tự không hợp lệ như khoảng trắng, ký tự đặc biệt lạ
+  const empRegex = /^[A-Z0-9_-]{2,}$/i;
+  
+  let skippedType = 0;
+  let skippedEmp = 0;
+  let skippedDate = 0;
+  let skippedMonth = 0;
+  let skippedTime = 0;
+  let processed = 0;
+  const skippedEmpCodes = new Set(); // Để log các mã bị skip
+  const validEmpCodes = new Set(); // Để log các mã hợp lệ
+  const validButSkipped = []; // Để log các dòng có mã hợp lệ nhưng bị skip vì lý do khác
+  
+  // Debug: Log các giá trị unique trong cột TYPE để xem có gì
+  const uniqueTypes = new Set();
+  for (let r = 1; r < Math.min(100, formValues.length); r++) {
+    const typeVal = String(formValues[r][actualTypeCol] || "").trim();
+    if (typeVal) uniqueTypes.add(typeVal);
+  }
+  Logger.log(`   Debug: Found ${uniqueTypes.size} unique TYPE values in first 100 rows:`);
+  Array.from(uniqueTypes).slice(0, 20).forEach((val, idx) => {
+    Logger.log(`     ${idx + 1}. "${val}"`);
+  });
+  
+  // Debug: Log vài giá trị type đầu tiên để kiểm tra
+  Logger.log("   Debug: Checking first 10 rows for type values...");
+  Logger.log(`   Using TYPE column index: ${actualTypeCol}, EMP_CODE column index: ${actualEmpCol}, SHIFT column index: ${actualShiftCol}`);
+  for (let debugR = 1; debugR <= Math.min(10, formValues.length - 1); debugR++) {
+    const debugRow = formValues[debugR];
+    const debugType = String(debugRow[actualTypeCol] || "").trim();
+    const debugEmp = String(debugRow[actualEmpCol] || "").trim();
+    const debugShift = debugRow[actualShiftCol];
+    const debugShiftStr = debugShift instanceof Date ? debugShift.toString() : String(debugShift || "").trim();
+    // Log thêm các cột xung quanh để debug
+    const debugTypePrev = String(debugRow[actualTypeCol - 1] || "").trim();
+    const debugTypeNext = String(debugRow[actualTypeCol + 1] || "").trim();
+    Logger.log(`   Row ${debugR + 1}: type[${actualTypeCol}]="${debugType}", emp="${debugEmp}", shift[${actualShiftCol}]="${debugShiftStr}"`);
+  }
+  
+  // Bỏ qua header row (row 0)
+  for (let r = 1; r < formValues.length; r++) {
+    const row = formValues[r];
+    
+    // Chỉ xử lý CA ONLINE - so sánh không phân biệt hoa thường và trim
+    const type = String(row[actualTypeCol] || "").trim();
+    const typeUpper = type.toUpperCase();
+    // Cho phép các biến thể: "CA ONLINE", "ca online", "CA ONLINE ", etc.
+    if (typeUpper !== "CA ONLINE") {
+      skippedType++;
+      continue;
+    }
+    
+    // Lấy mã nhân viên từ cột đã tìm được
+    const empCodeRaw = String(row[actualEmpCol] || "").trim();
+    if (!empCodeRaw) {
+      skippedEmp++;
+      skippedEmpCodes.add("(empty)");
+      continue; // Bỏ qua nếu không có mã
+    }
+    if (!empRegex.test(empCodeRaw)) {
+      skippedEmp++;
+      skippedEmpCodes.add(empCodeRaw);
+      continue; // Bỏ qua nếu mã không hợp lệ
+    }
+    const empCode = empCodeRaw.toUpperCase();
+    validEmpCodes.add(empCode);
+    
+    // Lấy ngày chấm công từ cột A (Dấu thời gian) và kiểm tra tháng 12/2025
+    const dateValue = row[FORM_COL_TIMESTAMP];
+    let dayStr = null;
+    let isDec2025 = false;
+    let parsedYear = null;
+    let parsedMonth = null;
+    let parsedDay = null;
+    
+    if (dateValue instanceof Date) {
+      parsedYear = dateValue.getFullYear();
+      parsedMonth = dateValue.getMonth() + 1; // getMonth() trả về 0-11
+      parsedDay = dateValue.getDate();
+      if (parsedYear === 2025 && parsedMonth === 12) {
+        isDec2025 = true;
+        dayStr = String(parsedDay);
+      }
+    } else {
+      const dateStr = String(dateValue || "").trim();
+      // Parse từ string "DD/MM/YYYY" hoặc "D/M/YYYY" (có thể có thêm giờ "DD/MM/YYYY HH:MM:SS")
+      // Regex sẽ match phần date trước dấu cách hoặc ký tự không phải số
+      const dateMatch = dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s|$)/);
+      if (dateMatch) {
+        parsedDay = dateMatch[1];
+        parsedMonth = dateMatch[2];
+        parsedYear = dateMatch[3];
+        // Kiểm tra tháng 12 (parseInt để xử lý cả "12" và "12")
+        if (parsedYear === "2025" && parseInt(parsedMonth) === 12) {
+          isDec2025 = true;
+          dayStr = parsedDay;
+        }
+      } else {
+        // Thử parse format khác: "YYYY-MM-DD" hoặc "DD-MM-YYYY" (có thể có thêm giờ)
+        const dateMatch2 = dateStr.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})(?:\s|$)/);
+        if (dateMatch2) {
+          // Format YYYY-MM-DD
+          parsedYear = dateMatch2[1];
+          parsedMonth = dateMatch2[2];
+          parsedDay = dateMatch2[3];
+          if (parsedYear === "2025" && parseInt(parsedMonth) === 12) {
+            isDec2025 = true;
+            dayStr = parsedDay;
+          }
+        } else {
+          // Thử format DD-MM-YYYY
+          const dateMatch3 = dateStr.match(/(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})(?:\s|$)/);
+          if (dateMatch3) {
+            parsedDay = dateMatch3[1];
+            parsedMonth = dateMatch3[2];
+            parsedYear = dateMatch3[3];
+            if (parsedYear === "2025" && parseInt(parsedMonth) === 12) {
+              isDec2025 = true;
+              dayStr = parsedDay;
+            }
+          }
+        }
+      }
+    }
+    
+    // Debug: Log vài dòng đầu để xem parse ngày và shift type
+    if (processed < 5 && empCode) {
+      const debugShift = row[actualShiftCol];
+      const debugShiftStr = debugShift instanceof Date ? debugShift.toString() : String(debugShift || "").trim();
+      Logger.log(`   DEBUG Row ${r + 1}, emp=${empCode}: dateValue="${dateValue}", parsed=${parsedYear}/${parsedMonth}/${parsedDay}, isDec2025=${isDec2025}, shift[${actualShiftCol}]="${debugShiftStr}"`);
+    }
+    
+    // Chỉ xử lý dữ liệu từ tháng 12/2025
+    if (!isDec2025) {
+      skippedMonth++;
+      if (validEmpCodes.has(empCode) && validButSkipped.length < 10) {
+        validButSkipped.push(`emp=${empCode}, date="${dateValue}", parsed=${parsedYear}/${parsedMonth}/${parsedDay} (not Dec 2025)`);
+      }
+      continue;
+    }
+    
+    // Validate dayStr - chuyển sang số để so sánh chính xác và chuẩn hóa format
+    const dayNum = parseInt(dayStr);
+    if (!dayStr || isNaN(dayNum) || dayNum < 1 || dayNum > 31) {
+      skippedDate++;
+      if (validEmpCodes.has(empCode) && validButSkipped.length < 10) {
+        validButSkipped.push(`emp=${empCode}, dayStr="${dayStr}" (invalid day)`);
+      }
+      continue;
+    }
+    // Chuẩn hóa dayStr: đảm bảo là string "1", "2", ..., "31" (không có leading zero)
+    dayStr = String(dayNum);
+    
+    // Lấy loại ca và timestamp
+    // Kiểm tra nếu shiftType là Date object thì bỏ qua (có thể đang lấy từ cột sai)
+    const shiftTypeRaw = row[actualShiftCol];
+    if (shiftTypeRaw instanceof Date) {
+      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Shift column ${actualShiftCol} contains Date object instead of shift type text. Skipping.`);
+      continue;
+    }
+    const shiftType = String(shiftTypeRaw || "").trim();
+    const timestamp = row[FORM_COL_TIMESTAMP];
+    
+    // Parse timestamp để lấy giờ
+    let timeStr = null;
+    if (timestamp instanceof Date) {
+      const hours = timestamp.getHours();
+      const minutes = timestamp.getMinutes();
+      timeStr = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+    } else {
+      // Parse từ string "DD/MM/YYYY HH:MM:SS" hoặc "DD/MM/YYYY H:MM:SS"
+      const timeMatch = String(timestamp || "").match(/(\d{1,2}):(\d{2}):\d{2}/);
+      if (timeMatch) {
+        const h = timeMatch[1];
+        const m = timeMatch[2];
+        timeStr = `${h.padStart(2, '0')}:${m}`;
+      }
+    }
+    if (!timeStr) {
+      skippedTime++;
+      if (validEmpCodes.has(empCode) && validButSkipped.length < 10) {
+        validButSkipped.push(`emp=${empCode}, day=${dayStr}, timestamp="${timestamp}" (cannot parse)`);
+      }
+      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Cannot parse timestamp: ${timestamp}`);
+      continue;
+    }
+    
+    processed++;
+    
+    // Khởi tạo map nếu chưa có
+    if (!onlineByEmpDay.has(empCode)) {
+      onlineByEmpDay.set(empCode, new Map());
+    }
+    const dayMap = onlineByEmpDay.get(empCode);
+    if (!dayMap.has(dayStr)) {
+      dayMap.set(dayStr, { morning: { in: null, out: null }, afternoon: { in: null, out: null } });
+    }
+    const dayData = dayMap.get(dayStr);
+    
+    // Phân loại ca và gán vào đúng vị trí
+    // Sử dụng toLowerCase() để match không phân biệt hoa thường
+    const shiftLower = shiftType.toLowerCase();
+    if (shiftLower.includes("check in ca sáng") || shiftLower.includes("check in ca sang")) {
+      dayData.morning.in = timeStr;
+    } else if (shiftLower.includes("check out ca sáng") || shiftLower.includes("check out ca sang")) {
+      dayData.morning.out = timeStr;
+    } else if (shiftLower.includes("check in ca chiều") || shiftLower.includes("check in ca chieu")) {
+      dayData.afternoon.in = timeStr;
+    } else if (shiftLower.includes("check out ca chiều") || shiftLower.includes("check out ca chieu")) {
+      dayData.afternoon.out = timeStr;
+    } else {
+      // Log các loại ca không match để debug - log cả giá trị gốc để xem có phải Date object không
+      const shiftTypeDebug = row[actualShiftCol];
+      const shiftTypeDebugStr = shiftTypeDebug instanceof Date ? shiftTypeDebug.toString() : String(shiftTypeDebug || "").trim();
+      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Unknown shift type: "${shiftType}" (raw value: "${shiftTypeDebugStr}", column ${actualShiftCol})`);
+    }
+    // Bỏ qua "Check in ca tối" vì chỉ xử lý ca sáng và ca chiều
+  }
+  
+  Logger.log(`   Parsed ${onlineByEmpDay.size} employees with online check-in data`);
+  Logger.log(`   Stats: processed=${processed}, skippedType=${skippedType}, skippedEmp=${skippedEmp}, skippedMonth=${skippedMonth}, skippedDate=${skippedDate}, skippedTime=${skippedTime}`);
+  
+  // Log các dòng có mã hợp lệ nhưng bị skip
+  if (validButSkipped.length > 0) {
+    Logger.log(`   Valid codes but skipped (samples):`);
+    validButSkipped.forEach((msg, idx) => {
+      Logger.log(`     ${idx + 1}. ${msg}`);
+    });
+  }
+  
+  // Debug: Log các mã hợp lệ và bị skip
+  Logger.log(`   Valid employee codes found: ${validEmpCodes.size}`);
+  if (validEmpCodes.size > 0 && validEmpCodes.size <= 50) {
+    Logger.log(`   Valid codes: ${Array.from(validEmpCodes).join(", ")}`);
+  } else if (validEmpCodes.size > 50) {
+    Logger.log(`   Valid codes (first 50): ${Array.from(validEmpCodes).slice(0, 50).join(", ")}`);
+  }
+  
+  Logger.log(`   Skipped employee codes: ${skippedEmpCodes.size}`);
+  if (skippedEmpCodes.size > 0 && skippedEmpCodes.size <= 30) {
+    Logger.log(`   Skipped codes (samples): ${Array.from(skippedEmpCodes).slice(0, 30).join(", ")}`);
+  } else if (skippedEmpCodes.size > 30) {
+    Logger.log(`   Skipped codes (first 30): ${Array.from(skippedEmpCodes).slice(0, 30).join(", ")}`);
+  }
+  
+  // ====== 3) OPEN MASTER SHEET ======
+  Logger.log("3) Opening master sheet...");
+  const masterSS = SpreadsheetApp.openById(MASTER_FILE_ID);
+  const masterSh = masterSS.getSheetByName(MASTER_SHEET_NAME);
+  if (!masterSh) throw new Error("Không tìm thấy sheet tổng: " + MASTER_SHEET_NAME);
+  
+  const masterInfo = buildMasterInfo_(masterSh, MASTER_EMP_COL, MASTER_HEADER_ROW);
+  const { empToRow, colByDay, minDayCol } = masterInfo;
+  
+  // Kiểm tra và đảm bảo mapping ngày -> cột đúng: ngày 1 -> DO (119), ngày 2 -> DP (120), ...
+  const colOfDay1 = colByDay.get("1");
+  if (colOfDay1 && colOfDay1 !== ONLINE_START_COL) {
+    Logger.log(`   WARNING: Day 1 is mapped to column ${colOfDay1}, but expected ${ONLINE_START_COL} (DO). Adjusting mapping...`);
+  }
+  
+  // ====== 4) BUILD DATA TO WRITE ======
+  Logger.log("4) Building data to write (columns DO-ES)...");
+  Logger.log(`   Mapping: Day 1 -> Column ${colOfDay1 || 'NOT FOUND'}, ONLINE_START_COL=${ONLINE_START_COL} (DO)`);
+  const lastEmpRow = masterInfo.lastEmpRow;
+  const dayColsCount = ONLINE_END_COL - ONLINE_START_COL + 1; // 31 cột
+  
+  // Khởi tạo mảng 2D: [row][col] = value
+  // Chỉ khởi tạo cho các hàng dữ liệu (từ hàng 2 đến lastEmpRow), bỏ qua hàng 1 (header)
+  // onlineBlock[0] tương ứng với hàng 2 trong sheet, onlineBlock[1] tương ứng với hàng 3, ...
+  const dataRowCount = lastEmpRow - 1; // Số hàng dữ liệu (bỏ qua hàng header)
+  const onlineBlock = [];
+  for (let r = 0; r < dataRowCount; r++) {
+    onlineBlock[r] = new Array(dayColsCount).fill("");
+  }
+  
+  let updatedCells = 0;
+  const notFound = [];
+  
+  for (const [empCode, dayMap] of onlineByEmpDay.entries()) {
+    const row1 = empToRow.get(empCode);
+    if (!row1) {
+      notFound.push(empCode);
+      continue;
+    }
+    // Bỏ qua hàng 1 (header) - chỉ xử lý từ hàng 2 trở đi
+    if (row1 === 1) {
+      Logger.log(`   WARNING: Skipping row 1 (header) for emp ${empCode}`);
+      continue;
+    }
+    // row1 là hàng trong sheet (2, 3, 4, ...), chuyển sang index trong onlineBlock (0, 1, 2, ...)
+    const r0 = row1 - 2; // Hàng 2 -> index 0, hàng 3 -> index 1, ...
+    
+    for (const [dayStr, dayData] of dayMap.entries()) {
+      const dayNum = parseInt(dayStr);
+      if (isNaN(dayNum) || dayNum < 1 || dayNum > 31) {
+        Logger.log(`   WARNING: Invalid dayStr "${dayStr}"`);
+        continue;
+      }
+      
+      // Tính cột đích trực tiếp: ngày 1 -> DO (119), ngày 2 -> DP (120), ..., ngày 31 -> ES (149)
+      // ONLINE_START_COL = 119 (DO), ngày 1 -> offset 0 -> cột 119, ngày 2 -> offset 1 -> cột 120, ...
+      const onlineC0 = dayNum - 1; // 0-based: ngày 1 -> 0, ngày 2 -> 1, ..., ngày 31 -> 30
+      
+      // Validate: offset phải từ 0 đến 30 (31 cột: DO=0, DP=1, ..., ES=30)
+      if (onlineC0 < 0 || onlineC0 >= dayColsCount) {
+        Logger.log(`   WARNING: Day ${dayStr} (dayNum=${dayNum}) offset ${onlineC0} is outside range [0, ${dayColsCount-1}]`);
+        continue;
+      }
+      
+      // Validate: r0 phải trong phạm vi onlineBlock
+      if (r0 < 0 || r0 >= dataRowCount) {
+        Logger.log(`   WARNING: Row index ${r0} (row ${row1}) is outside range [0, ${dataRowCount-1}]`);
+        continue;
+      }
+      
+      // Tính cột thực tế trong sheet để ghi
+      const targetCol = ONLINE_START_COL + onlineC0; // Ngày 1 -> 119, ngày 2 -> 120, ..., ngày 31 -> 149
+      
+      // Tạo format text dựa trên dữ liệu
+      const parts = [];
+      const hasMorning = dayData.morning.in || dayData.morning.out;
+      const hasAfternoon = dayData.afternoon.in || dayData.afternoon.out;
+      
+      if (hasMorning && hasAfternoon) {
+        // Có cả 2 ca -> "onl 2 ca"
+        const morningTimes = [];
+        if (dayData.morning.in) morningTimes.push(dayData.morning.in);
+        if (dayData.morning.out) morningTimes.push(dayData.morning.out);
+        const afternoonTimes = [];
+        if (dayData.afternoon.in) afternoonTimes.push(dayData.afternoon.in);
+        if (dayData.afternoon.out) afternoonTimes.push(dayData.afternoon.out);
+        
+        const allTimes = [...morningTimes, ...afternoonTimes];
+        onlineBlock[r0][onlineC0] = allTimes.join("\n") + "\nonl 2 ca";
+      } else if (hasMorning) {
+        // Chỉ có ca sáng
+        const morningTimes = [];
+        if (dayData.morning.in) morningTimes.push(dayData.morning.in);
+        if (dayData.morning.out) morningTimes.push(dayData.morning.out);
+        onlineBlock[r0][onlineC0] = morningTimes.join("\n") + "\nonl ca sáng";
+      } else if (hasAfternoon) {
+        // Chỉ có ca chiều
+        const afternoonTimes = [];
+        if (dayData.afternoon.in) afternoonTimes.push(dayData.afternoon.in);
+        if (dayData.afternoon.out) afternoonTimes.push(dayData.afternoon.out);
+        onlineBlock[r0][onlineC0] = afternoonTimes.join("\n") + "\nonl ca chiều";
+      }
+      
+      if (onlineBlock[r0][onlineC0]) {
+        updatedCells++;
+        // Debug: Log vài cell đầu để kiểm tra mapping
+        if (updatedCells <= 5) {
+          Logger.log(`   DEBUG: Writing day ${dayStr} (col ${targetCol}, offset ${onlineC0}) for emp ${empCode} at row ${row1}`);
+        }
+      }
+    }
+  }
+  
+  Logger.log(`   Prepared ${updatedCells} cells to update`);
+  if (notFound.length) {
+    Logger.log(`   Không tìm thấy ${notFound.length} mã trong sheet tổng (samples): ${notFound.slice(0, 20).join(", ")}`);
+    if (notFound.length > 20) {
+      Logger.log(`   ... và ${notFound.length - 20} mã khác`);
+    }
+  }
+  
+  // ====== 5) WRITE TO MASTER SHEET ======
+  if (updatedCells > 0) {
+    Logger.log("5) Writing to master sheet (columns DO-ES)...");
+    
+    // Write in batches để tránh timeout
+    // Ghi từ hàng 2 trở đi (bỏ qua hàng 1 header)
+    const BATCH_SIZE = 100;
+    let batchCount = 0;
+    let successCount = 0;
+    let errorCount = 0;
+    
+    for (let startRow = 0; startRow < dataRowCount; startRow += BATCH_SIZE) {
+      const endRow = Math.min(startRow + BATCH_SIZE, dataRowCount);
+      const batchRows = endRow - startRow;
+      const batchData = [];
+      
+      for (let r = startRow; r < endRow; r++) {
+        batchData.push(onlineBlock[r] || []);
+      }
+      
+      try {
+        // Ghi vào sheet từ hàng 2 (startRow + 2), vì startRow=0 tương ứng với hàng 2 trong sheet
+        const sheetRow = startRow + 2; // startRow=0 -> hàng 2, startRow=1 -> hàng 3, ...
+        const batchRange = masterSh.getRange(sheetRow, ONLINE_START_COL, batchRows, dayColsCount);
+        batchRange.setValues(batchData);
+        SpreadsheetApp.flush();
+        
+        batchCount++;
+        successCount += batchRows;
+        Logger.log(`   ✓ Batch ${batchCount}: rows ${sheetRow}-${sheetRow + batchRows - 1} (${batchRows} rows)`);
+        
+        if (batchCount % 5 === 0) {
+          Utilities.sleep(100);
+        }
+      } catch (batchError) {
+        errorCount++;
+        Logger.log(`   ✗ ERROR in batch ${batchCount} (rows ${startRow + 2}-${startRow + batchRows + 1}): ${batchError.message}`);
+      }
+    }
+    
+    Logger.log(`6) Write completed: ${batchCount} batches, ${successCount} rows written, ${errorCount} errors`);
+    SpreadsheetApp.flush();
+    Utilities.sleep(200);
+  } else {
+    Logger.log("5) No data to write");
+  }
+  
+  // Toast notification
+  try {
+    const message = `Đã cập nhật ${updatedCells} ô CA ONLINE vào cột DO-ES` +
+      (notFound.length ? ` (${notFound.length} mã không tìm thấy)` : "") +
+      (errorCount > 0 ? ` (${errorCount} batch lỗi)` : "");
+    masterSh.getRange(1, 1).setValue(masterSh.getRange(1, 1).getValue());
+    SpreadsheetApp.getActiveSpreadsheet().toast(message, "Hoàn thành", 5);
+    Logger.log(`Toast notification: ${message}`);
+  } catch (e) {
+    Logger.log(`Notification skipped. Finished: Updated ${updatedCells} ô.`);
+  }
+}
