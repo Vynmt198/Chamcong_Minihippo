@@ -4131,3 +4131,551 @@ function importOnlineFormToMaster() {
     Logger.log(`Notification skipped. Finished: Updated ${updatedCells} ô.`);
   }
 }
+
+/**
+ * IMPORT GOOGLE FORM CHẤM CÔNG OFFLINE -> SHEET TỔNG (Cột CB -> DF)
+ * Xử lý CA OFFLINE - CƠ SỞ KHÁC: fill vào cột CB -> DF với format "off ca sáng", "off ca chiều", "off 2 ca"
+ */
+function importOfflineFormToMaster() {
+  // ====== CONFIG ======
+  const FORM_FILE_ID = "1GATYUk6jMyNIRyDI1FxH-I9ix6NafyE3PwJn2ptHJ1k"; // File chứa form responses
+  const FORM_SHEET_NAME = "Form Responses 1";
+  
+  const MASTER_FILE_ID = "1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4";
+  const MASTER_SHEET_NAME = "Chấm công th12/2025";
+  
+  const MASTER_EMP_COL = 2;     // cột mã nhân viên (B)
+  const MASTER_HEADER_ROW = 1;  // hàng chứa số ngày 1..31
+  const OFFLINE_START_COL = 80;  // Cột CB (80 = CB)
+  const OFFLINE_END_COL = 110;   // Cột DF (110 = DF) = 31 cột
+  
+  // Mapping cột trong form responses (0-based index)
+  const FORM_COL_TIMESTAMP = 0;      // A: Dấu thời gian
+  const FORM_COL_EMAIL = 1;           // B: Email
+  const FORM_COL_EMP_CODE = 2;        // C: Mã nhân viên (đã sửa từ D sang C)
+  const FORM_COL_NAME = 3;            // D: Họ và tên
+  const FORM_COL_TEAM = 4;            // E: Team
+  const FORM_COL_DATE = 5;            // F: Ngày chấm công
+  const FORM_COL_SHIFT = 6;           // G: Ca làm việc
+  const FORM_COL_PROOF = 7;           // H: Minh chứng
+  const FORM_COL_TYPE = 9;            // J: EM CHẤM CÔNG CHO HÌNH THỨC (CA ONLINE / CA OFFLINE - CƠ SỞ KHÁC)
+  const FORM_COL_WORK_TYPE = 8;       // I: Hình thức làm việc (Parttime/Fulltime/Online)
+  
+  Logger.log("1) Opening form responses sheet...");
+  const formSS = SpreadsheetApp.openById(FORM_FILE_ID);
+  const formSh = formSS.getSheetByName(FORM_SHEET_NAME);
+  if (!formSh) throw new Error("Không tìm thấy sheet form: " + FORM_SHEET_NAME);
+  
+  const formValues = formSh.getDataRange().getValues();
+  Logger.log(`   Loaded ${formValues.length} rows from form`);
+  
+  // Debug: Log tất cả header để xem cấu trúc form
+  if (formValues.length > 0) {
+    const headerRow = formValues[0];
+    Logger.log(`   Debug: All headers (${headerRow.length} columns):`);
+    for (let c = 0; c < headerRow.length; c++) {
+      Logger.log(`     Col ${c}: "${headerRow[c]}"`);
+    }
+  }
+  
+  // Tự động tìm cột TYPE từ header row (row 0)
+  // Cột TYPE là cột J với header "EM CHẤM CÔNG CHO HÌNH THỨC:"
+  let actualTypeCol = FORM_COL_TYPE;
+  let foundTypeCol = false;
+  if (formValues.length > 0) {
+    const headerRow = formValues[0];
+    for (let c = 0; c < headerRow.length; c++) {
+      const headerText = String(headerRow[c] || "").toLowerCase().trim();
+      // Tìm cột có chứa "em chấm công cho hình thức" hoặc "hình thức"
+      if (headerText.includes("em chấm công cho hình thức") || 
+          headerText.includes("chấm công cho hình thức") ||
+          (headerText.includes("hình thức") && headerText.includes("chấm công"))) {
+        actualTypeCol = c;
+        foundTypeCol = true;
+        Logger.log(`   Found TYPE column at index ${c} (header: "${headerRow[c]}")`);
+        break;
+      }
+    }
+    // Nếu không tìm thấy, thử tìm bằng "ca online" hoặc "ca offline" nhưng KHÔNG phải "minh chứng"
+    if (!foundTypeCol) {
+      for (let c = 0; c < headerRow.length; c++) {
+        const headerText = String(headerRow[c] || "").toLowerCase().trim();
+        if ((headerText.includes("ca online") || headerText.includes("ca offline")) &&
+            !headerText.includes("minh chứng") && !headerText.includes("minh chung") &&
+            !headerText.includes("proof") && !headerText.includes("drive")) {
+          actualTypeCol = c;
+          foundTypeCol = true;
+          Logger.log(`   Found TYPE column at index ${c} (header: "${headerRow[c]}") by 'online/offline' keyword`);
+          break;
+        }
+      }
+    }
+    if (!foundTypeCol) {
+      Logger.log(`   WARNING: Could not find TYPE column automatically, using default index ${FORM_COL_TYPE} (column J)`);
+    }
+  }
+  
+  // Tự động tìm cột EMP_CODE từ header row
+  let actualEmpCol = FORM_COL_EMP_CODE;
+  if (formValues.length > 0) {
+    const headerRow = formValues[0];
+    for (let c = 0; c < headerRow.length; c++) {
+      const headerText = String(headerRow[c] || "").toLowerCase().trim();
+      if (headerText.includes("mã nhân viên") || headerText.includes("ma nhan vien") ||
+          headerText.includes("employee") || headerText.includes("code")) {
+        actualEmpCol = c;
+        Logger.log(`   Found EMP_CODE column at index ${c} (header: "${headerRow[c]}")`);
+        break;
+      }
+    }
+  }
+  
+  // Tự động tìm cột SHIFT từ header row
+  let actualShiftCol = FORM_COL_SHIFT;
+  if (formValues.length > 0) {
+    const headerRow = formValues[0];
+    for (let c = 0; c < headerRow.length; c++) {
+      const headerText = String(headerRow[c] || "").toLowerCase().trim();
+      if (headerText.includes("ca làm việc") || headerText.includes("ca lam viec") ||
+          headerText.includes("shift") || headerText.includes("ca sáng") || 
+          headerText.includes("ca chiều") || headerText.includes("ca sang") ||
+          headerText.includes("ca chieu")) {
+        actualShiftCol = c;
+        Logger.log(`   Found SHIFT column at index ${c} (header: "${headerRow[c]}")`);
+        break;
+      }
+    }
+  }
+  
+  // ====== 2) PARSE FORM DATA - CHỈ LẤY CA OFFLINE VÀ THÁNG 12/2025 ======
+  Logger.log("2) Parsing form data (CA OFFLINE only, month 12/2025)...");
+  // Map: empCode -> Map<dayStr, {morning: {in, out}, afternoon: {in, out}}>
+  const offlineByEmpDay = new Map();
+  // Mã nhân viên có thể là MHxxxx, LL082, HN045, etc. - không giới hạn format
+  // Nới lỏng regex: cho phép chữ cái, số, và một số ký tự đặc biệt thường gặp
+  // Loại bỏ các ký tự không hợp lệ như khoảng trắng, ký tự đặc biệt lạ
+  const empRegex = /^[A-Z0-9_-]{2,}$/i;
+  
+  let skippedType = 0;
+  let skippedEmp = 0;
+  let skippedDate = 0;
+  let skippedMonth = 0;
+  let skippedTime = 0;
+  let processed = 0;
+  const skippedEmpCodes = new Set(); // Để log các mã bị skip
+  const validEmpCodes = new Set(); // Để log các mã hợp lệ
+  const validButSkipped = []; // Để log các dòng có mã hợp lệ nhưng bị skip vì lý do khác
+  
+  // Debug: Log các giá trị unique trong cột TYPE để xem có gì
+  const uniqueTypes = new Set();
+  for (let r = 1; r < Math.min(100, formValues.length); r++) {
+    const typeVal = String(formValues[r][actualTypeCol] || "").trim();
+    if (typeVal) uniqueTypes.add(typeVal);
+  }
+  Logger.log(`   Debug: Found ${uniqueTypes.size} unique TYPE values in first 100 rows:`);
+  Array.from(uniqueTypes).slice(0, 20).forEach((val, idx) => {
+    Logger.log(`     ${idx + 1}. "${val}"`);
+  });
+  
+  // Debug: Log vài giá trị type đầu tiên để kiểm tra
+  Logger.log("   Debug: Checking first 10 rows for type values...");
+  Logger.log(`   Using TYPE column index: ${actualTypeCol}, EMP_CODE column index: ${actualEmpCol}, SHIFT column index: ${actualShiftCol}`);
+  for (let debugR = 1; debugR <= Math.min(10, formValues.length - 1); debugR++) {
+    const debugRow = formValues[debugR];
+    const debugType = String(debugRow[actualTypeCol] || "").trim();
+    const debugEmp = String(debugRow[actualEmpCol] || "").trim();
+    const debugShift = debugRow[actualShiftCol];
+    const debugShiftStr = debugShift instanceof Date ? debugShift.toString() : String(debugShift || "").trim();
+    // Log thêm các cột xung quanh để debug
+    const debugTypePrev = String(debugRow[actualTypeCol - 1] || "").trim();
+    const debugTypeNext = String(debugRow[actualTypeCol + 1] || "").trim();
+    Logger.log(`   Row ${debugR + 1}: type[${actualTypeCol}]="${debugType}", emp="${debugEmp}", shift[${actualShiftCol}]="${debugShiftStr}"`);
+  }
+  
+  // Bỏ qua header row (row 0)
+  for (let r = 1; r < formValues.length; r++) {
+    const row = formValues[r];
+    
+    // Chỉ xử lý CA OFFLINE - so sánh không phân biệt hoa thường và trim
+    const type = String(row[actualTypeCol] || "").trim();
+    const typeUpper = type.toUpperCase();
+    // Cho phép các biến thể: "CA OFFLINE", "ca offline", "CA OFFLINE ", "CA OFFLINE - CƠ SỞ KHÁC", etc.
+    // Kiểm tra nếu chứa "CA OFFLINE" (có thể có thêm text sau)
+    if (!typeUpper.includes("CA OFFLINE")) {
+      skippedType++;
+      continue;
+    }
+    
+    // Lấy mã nhân viên từ cột đã tìm được
+    const empCodeRaw = String(row[actualEmpCol] || "").trim();
+    if (!empCodeRaw) {
+      skippedEmp++;
+      skippedEmpCodes.add("(empty)");
+      continue; // Bỏ qua nếu không có mã
+    }
+    if (!empRegex.test(empCodeRaw)) {
+      skippedEmp++;
+      skippedEmpCodes.add(empCodeRaw);
+      continue; // Bỏ qua nếu mã không hợp lệ
+    }
+    const empCode = empCodeRaw.toUpperCase();
+    validEmpCodes.add(empCode);
+    
+    // Lấy ngày chấm công từ cột A (Dấu thời gian) và kiểm tra tháng 12/2025
+    const dateValue = row[FORM_COL_TIMESTAMP];
+    let dayStr = null;
+    let isDec2025 = false;
+    let parsedYear = null;
+    let parsedMonth = null;
+    let parsedDay = null;
+    
+    if (dateValue instanceof Date) {
+      parsedYear = dateValue.getFullYear();
+      parsedMonth = dateValue.getMonth() + 1; // getMonth() trả về 0-11
+      parsedDay = dateValue.getDate();
+      if (parsedYear === 2025 && parsedMonth === 12) {
+        isDec2025 = true;
+        dayStr = String(parsedDay);
+      }
+    } else {
+      const dateStr = String(dateValue || "").trim();
+      // Parse từ string "DD/MM/YYYY" hoặc "D/M/YYYY" (có thể có thêm giờ "DD/MM/YYYY HH:MM:SS")
+      // Regex sẽ match phần date trước dấu cách hoặc ký tự không phải số
+      const dateMatch = dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s|$)/);
+      if (dateMatch) {
+        parsedDay = dateMatch[1];
+        parsedMonth = dateMatch[2];
+        parsedYear = dateMatch[3];
+        // Kiểm tra tháng 12 (parseInt để xử lý cả "12" và "12")
+        if (parsedYear === "2025" && parseInt(parsedMonth) === 12) {
+          isDec2025 = true;
+          dayStr = parsedDay;
+        }
+      } else {
+        // Thử parse format khác: "YYYY-MM-DD" hoặc "DD-MM-YYYY" (có thể có thêm giờ)
+        const dateMatch2 = dateStr.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})(?:\s|$)/);
+        if (dateMatch2) {
+          // Format YYYY-MM-DD
+          parsedYear = dateMatch2[1];
+          parsedMonth = dateMatch2[2];
+          parsedDay = dateMatch2[3];
+          if (parsedYear === "2025" && parseInt(parsedMonth) === 12) {
+            isDec2025 = true;
+            dayStr = parsedDay;
+          }
+        } else {
+          // Thử format DD-MM-YYYY
+          const dateMatch3 = dateStr.match(/(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})(?:\s|$)/);
+          if (dateMatch3) {
+            parsedDay = dateMatch3[1];
+            parsedMonth = dateMatch3[2];
+            parsedYear = dateMatch3[3];
+            if (parsedYear === "2025" && parseInt(parsedMonth) === 12) {
+              isDec2025 = true;
+              dayStr = parsedDay;
+            }
+          }
+        }
+      }
+    }
+    
+    // Debug: Log vài dòng đầu để xem parse ngày và shift type
+    if (processed < 5 && empCode) {
+      const debugShift = row[actualShiftCol];
+      const debugShiftStr = debugShift instanceof Date ? debugShift.toString() : String(debugShift || "").trim();
+      Logger.log(`   DEBUG Row ${r + 1}, emp=${empCode}: dateValue="${dateValue}", parsed=${parsedYear}/${parsedMonth}/${parsedDay}, isDec2025=${isDec2025}, shift[${actualShiftCol}]="${debugShiftStr}"`);
+    }
+    
+    // Chỉ xử lý dữ liệu từ tháng 12/2025
+    if (!isDec2025) {
+      skippedMonth++;
+      if (validEmpCodes.has(empCode) && validButSkipped.length < 10) {
+        validButSkipped.push(`emp=${empCode}, date="${dateValue}", parsed=${parsedYear}/${parsedMonth}/${parsedDay} (not Dec 2025)`);
+      }
+      continue;
+    }
+    
+    // Validate dayStr - chuyển sang số để so sánh chính xác và chuẩn hóa format
+    const dayNum = parseInt(dayStr);
+    if (!dayStr || isNaN(dayNum) || dayNum < 1 || dayNum > 31) {
+      skippedDate++;
+      if (validEmpCodes.has(empCode) && validButSkipped.length < 10) {
+        validButSkipped.push(`emp=${empCode}, dayStr="${dayStr}" (invalid day)`);
+      }
+      continue;
+    }
+    // Chuẩn hóa dayStr: đảm bảo là string "1", "2", ..., "31" (không có leading zero)
+    dayStr = String(dayNum);
+    
+    // Lấy loại ca và timestamp
+    // Kiểm tra nếu shiftType là Date object thì bỏ qua (có thể đang lấy từ cột sai)
+    const shiftTypeRaw = row[actualShiftCol];
+    if (shiftTypeRaw instanceof Date) {
+      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Shift column ${actualShiftCol} contains Date object instead of shift type text. Skipping.`);
+      continue;
+    }
+    const shiftType = String(shiftTypeRaw || "").trim();
+    const timestamp = row[FORM_COL_TIMESTAMP];
+    
+    // Parse timestamp để lấy giờ
+    let timeStr = null;
+    if (timestamp instanceof Date) {
+      const hours = timestamp.getHours();
+      const minutes = timestamp.getMinutes();
+      timeStr = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+    } else {
+      // Parse từ string "DD/MM/YYYY HH:MM:SS" hoặc "DD/MM/YYYY H:MM:SS"
+      const timeMatch = String(timestamp || "").match(/(\d{1,2}):(\d{2}):\d{2}/);
+      if (timeMatch) {
+        const h = timeMatch[1];
+        const m = timeMatch[2];
+        timeStr = `${h.padStart(2, '0')}:${m}`;
+      }
+    }
+    if (!timeStr) {
+      skippedTime++;
+      if (validEmpCodes.has(empCode) && validButSkipped.length < 10) {
+        validButSkipped.push(`emp=${empCode}, day=${dayStr}, timestamp="${timestamp}" (cannot parse)`);
+      }
+      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Cannot parse timestamp: ${timestamp}`);
+      continue;
+    }
+    
+    processed++;
+    
+    // Khởi tạo map nếu chưa có
+    if (!offlineByEmpDay.has(empCode)) {
+      offlineByEmpDay.set(empCode, new Map());
+    }
+    const dayMap = offlineByEmpDay.get(empCode);
+    if (!dayMap.has(dayStr)) {
+      dayMap.set(dayStr, { morning: { in: null, out: null }, afternoon: { in: null, out: null } });
+    }
+    const dayData = dayMap.get(dayStr);
+    
+    // Phân loại ca và gán vào đúng vị trí
+    // Sử dụng toLowerCase() để match không phân biệt hoa thường
+    const shiftLower = shiftType.toLowerCase();
+    if (shiftLower.includes("check in ca sáng") || shiftLower.includes("check in ca sang")) {
+      dayData.morning.in = timeStr;
+    } else if (shiftLower.includes("check out ca sáng") || shiftLower.includes("check out ca sang")) {
+      dayData.morning.out = timeStr;
+    } else if (shiftLower.includes("check in ca chiều") || shiftLower.includes("check in ca chieu")) {
+      dayData.afternoon.in = timeStr;
+    } else if (shiftLower.includes("check out ca chiều") || shiftLower.includes("check out ca chieu")) {
+      dayData.afternoon.out = timeStr;
+    } else {
+      // Log các loại ca không match để debug - log cả giá trị gốc để xem có phải Date object không
+      const shiftTypeDebug = row[actualShiftCol];
+      const shiftTypeDebugStr = shiftTypeDebug instanceof Date ? shiftTypeDebug.toString() : String(shiftTypeDebug || "").trim();
+      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Unknown shift type: "${shiftType}" (raw value: "${shiftTypeDebugStr}", column ${actualShiftCol})`);
+    }
+    // Bỏ qua "Check in ca tối" vì chỉ xử lý ca sáng và ca chiều
+  }
+  
+  Logger.log(`   Parsed ${offlineByEmpDay.size} employees with offline check-in data`);
+  Logger.log(`   Stats: processed=${processed}, skippedType=${skippedType}, skippedEmp=${skippedEmp}, skippedMonth=${skippedMonth}, skippedDate=${skippedDate}, skippedTime=${skippedTime}`);
+  
+  // Log các dòng có mã hợp lệ nhưng bị skip
+  if (validButSkipped.length > 0) {
+    Logger.log(`   Valid codes but skipped (samples):`);
+    validButSkipped.forEach((msg, idx) => {
+      Logger.log(`     ${idx + 1}. ${msg}`);
+    });
+  }
+  
+  // Debug: Log các mã hợp lệ và bị skip
+  Logger.log(`   Valid employee codes found: ${validEmpCodes.size}`);
+  if (validEmpCodes.size > 0 && validEmpCodes.size <= 50) {
+    Logger.log(`   Valid codes: ${Array.from(validEmpCodes).join(", ")}`);
+  } else if (validEmpCodes.size > 50) {
+    Logger.log(`   Valid codes (first 50): ${Array.from(validEmpCodes).slice(0, 50).join(", ")}`);
+  }
+  
+  Logger.log(`   Skipped employee codes: ${skippedEmpCodes.size}`);
+  if (skippedEmpCodes.size > 0 && skippedEmpCodes.size <= 30) {
+    Logger.log(`   Skipped codes (samples): ${Array.from(skippedEmpCodes).slice(0, 30).join(", ")}`);
+  } else if (skippedEmpCodes.size > 30) {
+    Logger.log(`   Skipped codes (first 30): ${Array.from(skippedEmpCodes).slice(0, 30).join(", ")}`);
+  }
+  
+  // ====== 3) OPEN MASTER SHEET ======
+  Logger.log("3) Opening master sheet...");
+  const masterSS = SpreadsheetApp.openById(MASTER_FILE_ID);
+  const masterSh = masterSS.getSheetByName(MASTER_SHEET_NAME);
+  if (!masterSh) throw new Error("Không tìm thấy sheet tổng: " + MASTER_SHEET_NAME);
+  
+  const masterInfo = buildMasterInfo_(masterSh, MASTER_EMP_COL, MASTER_HEADER_ROW);
+  const { empToRow, colByDay, minDayCol } = masterInfo;
+  
+  // Kiểm tra và đảm bảo mapping ngày -> cột đúng: ngày 1 -> CB (80), ngày 2 -> CC (81), ...
+  const colOfDay1 = colByDay.get("1");
+  if (colOfDay1 && colOfDay1 !== OFFLINE_START_COL) {
+    Logger.log(`   WARNING: Day 1 is mapped to column ${colOfDay1}, but expected ${OFFLINE_START_COL} (CB). Adjusting mapping...`);
+  }
+  
+  // ====== 4) BUILD DATA TO WRITE ======
+  Logger.log("4) Building data to write (columns CB-DF)...");
+  Logger.log(`   Mapping: Day 1 -> Column ${colOfDay1 || 'NOT FOUND'}, OFFLINE_START_COL=${OFFLINE_START_COL} (CB)`);
+  const lastEmpRow = masterInfo.lastEmpRow;
+  const dayColsCount = OFFLINE_END_COL - OFFLINE_START_COL + 1; // 31 cột
+  
+  // Khởi tạo mảng 2D: [row][col] = value
+  // Chỉ khởi tạo cho các hàng dữ liệu (từ hàng 2 đến lastEmpRow), bỏ qua hàng 1 (header)
+  // offlineBlock[0] tương ứng với hàng 2 trong sheet, offlineBlock[1] tương ứng với hàng 3, ...
+  const dataRowCount = lastEmpRow - 1; // Số hàng dữ liệu (bỏ qua hàng header)
+  const offlineBlock = [];
+  for (let r = 0; r < dataRowCount; r++) {
+    offlineBlock[r] = new Array(dayColsCount).fill("");
+  }
+  
+  let updatedCells = 0;
+  const notFound = [];
+  
+  for (const [empCode, dayMap] of offlineByEmpDay.entries()) {
+    const row1 = empToRow.get(empCode);
+    if (!row1) {
+      notFound.push(empCode);
+      continue;
+    }
+    // Bỏ qua hàng 1 (header) - chỉ xử lý từ hàng 2 trở đi
+    if (row1 === 1) {
+      Logger.log(`   WARNING: Skipping row 1 (header) for emp ${empCode}`);
+      continue;
+    }
+    // row1 là hàng trong sheet (2, 3, 4, ...), chuyển sang index trong offlineBlock (0, 1, 2, ...)
+    const r0 = row1 - 2; // Hàng 2 -> index 0, hàng 3 -> index 1, ...
+    
+    for (const [dayStr, dayData] of dayMap.entries()) {
+      const dayNum = parseInt(dayStr);
+      if (isNaN(dayNum) || dayNum < 1 || dayNum > 31) {
+        Logger.log(`   WARNING: Invalid dayStr "${dayStr}"`);
+        continue;
+      }
+      
+      // Tính cột đích trực tiếp: ngày 1 -> CB (80), ngày 2 -> CC (81), ..., ngày 31 -> DF (110)
+      // OFFLINE_START_COL = 80 (CB), ngày 1 -> offset 0 -> cột 80, ngày 2 -> offset 1 -> cột 81, ...
+      const offlineC0 = dayNum - 1; // 0-based: ngày 1 -> 0, ngày 2 -> 1, ..., ngày 31 -> 30
+      
+      // Validate: offset phải từ 0 đến 30 (31 cột: CB=0, CC=1, ..., DF=30)
+      if (offlineC0 < 0 || offlineC0 >= dayColsCount) {
+        Logger.log(`   WARNING: Day ${dayStr} (dayNum=${dayNum}) offset ${offlineC0} is outside range [0, ${dayColsCount-1}]`);
+        continue;
+      }
+      
+      // Validate: r0 phải trong phạm vi offlineBlock
+      if (r0 < 0 || r0 >= dataRowCount) {
+        Logger.log(`   WARNING: Row index ${r0} (row ${row1}) is outside range [0, ${dataRowCount-1}]`);
+        continue;
+      }
+      
+      // Tính cột thực tế trong sheet để ghi
+      const targetCol = OFFLINE_START_COL + offlineC0; // Ngày 1 -> 80, ngày 2 -> 81, ..., ngày 31 -> 110
+      
+      // Tạo format text dựa trên dữ liệu
+      const parts = [];
+      const hasMorning = dayData.morning.in || dayData.morning.out;
+      const hasAfternoon = dayData.afternoon.in || dayData.afternoon.out;
+      
+      if (hasMorning && hasAfternoon) {
+        // Có cả 2 ca -> "off 2 ca"
+        const morningTimes = [];
+        if (dayData.morning.in) morningTimes.push(dayData.morning.in);
+        if (dayData.morning.out) morningTimes.push(dayData.morning.out);
+        const afternoonTimes = [];
+        if (dayData.afternoon.in) afternoonTimes.push(dayData.afternoon.in);
+        if (dayData.afternoon.out) afternoonTimes.push(dayData.afternoon.out);
+        
+        const allTimes = [...morningTimes, ...afternoonTimes];
+        offlineBlock[r0][offlineC0] = allTimes.join("\n") + "\noff 2 ca";
+      } else if (hasMorning) {
+        // Chỉ có ca sáng
+        const morningTimes = [];
+        if (dayData.morning.in) morningTimes.push(dayData.morning.in);
+        if (dayData.morning.out) morningTimes.push(dayData.morning.out);
+        offlineBlock[r0][offlineC0] = morningTimes.join("\n") + "\noff ca sáng";
+      } else if (hasAfternoon) {
+        // Chỉ có ca chiều
+        const afternoonTimes = [];
+        if (dayData.afternoon.in) afternoonTimes.push(dayData.afternoon.in);
+        if (dayData.afternoon.out) afternoonTimes.push(dayData.afternoon.out);
+        offlineBlock[r0][offlineC0] = afternoonTimes.join("\n") + "\noff ca chiều";
+      }
+      
+      if (offlineBlock[r0][offlineC0]) {
+        updatedCells++;
+        // Debug: Log vài cell đầu để kiểm tra mapping
+        if (updatedCells <= 5) {
+          Logger.log(`   DEBUG: Writing day ${dayStr} (col ${targetCol}, offset ${offlineC0}) for emp ${empCode} at row ${row1}`);
+        }
+      }
+    }
+  }
+  
+  Logger.log(`   Prepared ${updatedCells} cells to update`);
+  if (notFound.length) {
+    Logger.log(`   Không tìm thấy ${notFound.length} mã trong sheet tổng (samples): ${notFound.slice(0, 20).join(", ")}`);
+    if (notFound.length > 20) {
+      Logger.log(`   ... và ${notFound.length - 20} mã khác`);
+    }
+  }
+  
+  // ====== 5) WRITE TO MASTER SHEET ======
+  if (updatedCells > 0) {
+    Logger.log("5) Writing to master sheet (columns CB-DF)...");
+    
+    // Write in batches để tránh timeout
+    // Ghi từ hàng 2 trở đi (bỏ qua hàng 1 header)
+    const BATCH_SIZE = 100;
+    let batchCount = 0;
+    let successCount = 0;
+    let errorCount = 0;
+    
+    for (let startRow = 0; startRow < dataRowCount; startRow += BATCH_SIZE) {
+      const endRow = Math.min(startRow + BATCH_SIZE, dataRowCount);
+      const batchRows = endRow - startRow;
+      const batchData = [];
+      
+      for (let r = startRow; r < endRow; r++) {
+        batchData.push(offlineBlock[r] || []);
+      }
+      
+      try {
+        // Ghi vào sheet từ hàng 2 (startRow + 2), vì startRow=0 tương ứng với hàng 2 trong sheet
+        const sheetRow = startRow + 2; // startRow=0 -> hàng 2, startRow=1 -> hàng 3, ...
+        const batchRange = masterSh.getRange(sheetRow, OFFLINE_START_COL, batchRows, dayColsCount);
+        batchRange.setValues(batchData);
+        SpreadsheetApp.flush();
+        
+        batchCount++;
+        successCount += batchRows;
+        Logger.log(`   ✓ Batch ${batchCount}: rows ${sheetRow}-${sheetRow + batchRows - 1} (${batchRows} rows)`);
+        
+        if (batchCount % 5 === 0) {
+          Utilities.sleep(100);
+        }
+      } catch (batchError) {
+        errorCount++;
+        Logger.log(`   ✗ ERROR in batch ${batchCount} (rows ${startRow + 2}-${startRow + batchRows + 1}): ${batchError.message}`);
+      }
+    }
+    
+    Logger.log(`6) Write completed: ${batchCount} batches, ${successCount} rows written, ${errorCount} errors`);
+    SpreadsheetApp.flush();
+    Utilities.sleep(200);
+  } else {
+    Logger.log("5) No data to write");
+  }
+  
+  // Toast notification
+  try {
+    const message = `Đã cập nhật ${updatedCells} ô CA OFFLINE vào cột CB-DF` +
+      (notFound.length ? ` (${notFound.length} mã không tìm thấy)` : "") +
+      (errorCount > 0 ? ` (${errorCount} batch lỗi)` : "");
+    masterSh.getRange(1, 1).setValue(masterSh.getRange(1, 1).getValue());
+    SpreadsheetApp.getActiveSpreadsheet().toast(message, "Hoàn thành", 5);
+    Logger.log(`Toast notification: ${message}`);
+  } catch (e) {
+    Logger.log(`Notification skipped. Finished: Updated ${updatedCells} ô.`);
+  }
+}
