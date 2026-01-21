@@ -1032,7 +1032,9 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
     times: morningTimes,
     in: morningIn,
     out: morningOut,
-    missingIn: morningIn === null,
+    // missingIn: thiếu check-in ca sáng (có thể có check-out nhưng không có check-in)
+    missingIn: morningIn === null && (morningOut !== null || morningTimes.length > 0),
+    // missingOut: có check-in nhưng thiếu check-out
     missingOut: morningIn !== null && morningOut === null,
     lateMinutes: morningLateMinutes,
     earlyMinutes: 0
@@ -1042,7 +1044,9 @@ function computeSessionsBySchedule_(times, schedule, registeredSessions) {
     times: afternoonTimes,
     in: afternoonIn,
     out: afternoonOut,
-    missingIn: afternoonIn === null,
+    // missingIn: thiếu check-in ca chiều (có thể có check-out nhưng không có check-in)
+    missingIn: afternoonIn === null && (afternoonOut !== null || afternoonTimes.length > 0),
+    // missingOut: có check-in nhưng thiếu check-out
     missingOut: afternoonIn !== null && afternoonOut === null,
     lateMinutes: afternoonLateMinutes,
     earlyMinutes: 0
@@ -1243,14 +1247,41 @@ function handleMissingCheckInOutSimple_(session, human, dayStr, month) {
 function handleLateSimple_(session, human, dayStr, month, masterInfo, r0, emp, sessionName, problematicCells) {
   const notes = [];
   let lateDelta = 0;
+  let offForgotDelta = 0;
 
-  if (session.in && session.lateMinutes && session.lateMinutes > 0) {
+  // Rule helper: chỉ áp dụng chuyển lỗi cho Quản lý hoặc Sale bình thường
+  const isManagerOrNormalSale = (empId, roleVal) => {
+    const e = String(empId || '').toUpperCase();
+    const roleStr = String(roleVal || '').trim().toUpperCase();
+
+    // Quản lý theo role hoặc theo danh sách mã
+    if (roleStr.includes('QL') || roleStr.includes('QUAN') || roleStr.includes('MANAGER')) return true;
+    if (SPECIAL_SCHEDULES && SPECIAL_SCHEDULES.managers && Array.isArray(SPECIAL_SCHEDULES.managers.ids) && SPECIAL_SCHEDULES.managers.ids.includes(e)) return true;
+
+    // Không coi là "sale bình thường"
+    if (roleStr.includes('PART')) return false;
+    if (roleStr.includes('ONL') || roleStr.includes('ONLINE')) return false;
+    if (SPECIAL_SCHEDULES && SPECIAL_SCHEDULES.reception && Array.isArray(SPECIAL_SCHEDULES.reception.ids) && SPECIAL_SCHEDULES.reception.ids.includes(e)) return false;
+
+    // Mặc định: sale/nhân viên bình thường (FULL hoặc trống)
+    return true;
+  };
+
+  // CHỈ xét TRỄ khi session có đủ cả check-in và check-out.
+  // Trường hợp chỉ có 1 mốc (quên check-out) thì chỉ ghi "Quên check out", không ghi "Trễ" để tránh sai.
+  if (session && session.in && session.out && session.lateMinutes && session.lateMinutes > 0) {
     const lateMinutes = Math.round(session.lateMinutes);
 
-    if (session.lateMinutes >= 30) {
-      // Trễ trên 30 phút - ghi rõ và đếm vào lateCount
-      notes.push(`- Check in trễ trên 30 phút (${lateMinutes} phút) ${human} ${dayStr}/${month}`);
-      lateDelta++;
+    // YÊU CẦU MỚI:
+    // - Trễ > 30 phút (tức >=31 phút sau khi làm tròn) => chuyển thành lỗi QUÊN CHECK IN
+    // - Chỉ cộng 1 lỗi quên check in (không double với lỗi trễ)
+    const threshold = 30;
+    const roleVal = masterInfo && masterInfo.empToRole ? masterInfo.empToRole.get(String(emp || '').toUpperCase()) : undefined;
+    const shouldConvertToMissing = isManagerOrNormalSale(emp, roleVal) && lateMinutes > threshold;
+
+    if (shouldConvertToMissing) {
+      notes.push(`- Quên check in (do check in muộn ${lateMinutes} phút > 30p) ${human} ${dayStr}/${month}`);
+      offForgotDelta++;
 
       // Thêm vào problematicCells để highlight
       const col1 = masterInfo.colByDay.get(dayStr);
@@ -1262,7 +1293,7 @@ function handleLateSimple_(session, human, dayStr, month, masterInfo, r0, emp, s
             c0,
             emp,
             dayStr,
-            type: 'late',
+            type: 'missing_in_over_30',
             sessionName: sessionName,
             lateMinutes: session.lateMinutes,
             checkInTime: session.in
@@ -1270,12 +1301,36 @@ function handleLateSimple_(session, human, dayStr, month, masterInfo, r0, emp, s
         }
       }
     } else {
-      // Trễ dưới 30 phút - ghi rõ nhưng không đếm vào lateCount
-      notes.push(`- Check in trễ dưới 30 phút (${lateMinutes} phút) ${human} ${dayStr}/${month}`);
+      if (lateMinutes > threshold) {
+        // Trễ trên 30 phút (nhưng KHÔNG thuộc nhóm chuyển lỗi) - ghi và đếm như cũ
+        notes.push(`- Check in trễ trên 30 phút (${lateMinutes} phút) ${human} ${dayStr}/${month}`);
+        lateDelta++;
+
+        const col1 = masterInfo.colByDay.get(dayStr);
+        if (col1) {
+          const c0 = col1 - masterInfo.minDayCol;
+          if (c0 >= 0 && c0 < masterInfo.dayColsCount) {
+            problematicCells.push({
+              r0,
+              c0,
+              emp,
+              dayStr,
+              type: 'late',
+              sessionName: sessionName,
+              lateMinutes: session.lateMinutes,
+              checkInTime: session.in
+            });
+          }
+        }
+      } else {
+        // Trễ <= 30 phút - vẫn là 1 lỗi TRỄ và cần cộng vào lateCount (hiển thị ở cột Q)
+        notes.push(`- Check in trễ dưới hoặc bằng 30 phút (${lateMinutes} phút) ${human} ${dayStr}/${month}`);
+        lateDelta++;
+      }
     }
   }
 
-  return { notes, lateDelta };
+  return { notes, lateDelta, offForgotDelta };
 }
 
 /**
@@ -1340,10 +1395,36 @@ function findHeaderCols_(headerRow) {
   // detail columns (chi tiet) -> collect in order
   const detailIdx = [];
   headers.forEach((h, idx) => { if (h.n.includes("chi tiet")) detailIdx.push(idx + 1); });
-  if (detailIdx.length) map.detail2Col = detailIdx[0];
+  
+  // Tìm cột S cụ thể (cột 19) để ghi note TRỄ
+  map.detail2Col = null;
+  // Ưu tiên 1: Luôn dùng cột S (19) nếu tồn tại (bất kể header là gì)
+  if (headers.length >= 19) {
+    map.detail2Col = 19; // Cột S - luôn dùng để ghi note TRỄ
+  }
+  // Ưu tiên 2: Nếu cột S không tồn tại, tìm cột có "Chi tiết(2)" hoặc "Chi tiết (2)"
+  if (!map.detail2Col) {
+    headers.forEach((h, idx) => {
+      if ((h.n.includes("chi tiet") && (h.n.includes("2") || h.raw.includes("(2)"))) ||
+          (h.raw.includes("Chi tiết(2)") || h.raw.includes("Chi tiết (2)"))) {
+        map.detail2Col = idx + 1;
+      }
+    });
+  }
+  // Fallback: Nếu không tìm thấy, dùng cột "Chi tiết" đầu tiên
+  if (!map.detail2Col && detailIdx.length) {
+    map.detail2Col = detailIdx[0];
+  }
   if (detailIdx.length > 1) map.detail3Col = detailIdx[1];
   // lateNoteCol: ưu tiên Chi tiết(2) (thường là cột S) để ghi note TRỄ
   map.lateNoteCol = map.detail2Col || null;
+
+  // Cột Q (17): số lượng lỗi TRỄ
+  // YÊU CẦU: luôn hiển thị số lượng lỗi trễ tại cột Q => ưu tiên tuyệt đối nếu tồn tại.
+  map.totalLateCol = null;
+  if (headers.length >= 17) {
+    map.totalLateCol = 17; // Column Q
+  }
 
   // Tìm cột W cụ thể - cột có header "CHI TIẾT (3)" hoặc "chi tiet" và số "3"
   map.noteCol = null;
@@ -1403,6 +1484,7 @@ function findHeaderCols_(headerRow) {
   // totals and flags
   headers.forEach((h, idx) => {
     const i = idx + 1;
+    // totalLateCol đã ưu tiên cố định cột Q ở trên; chỉ fallback nếu sheet thiếu cột Q
     if (!map.totalLateCol && h.n.includes("tong tre")) map.totalLateCol = i;
     if (!map.offForgotCol && h.n.includes("off quen")) map.offForgotCol = i;
     // Bỏ tìm cột V (onlForgotCol) - không sử dụng nữa
@@ -2207,8 +2289,19 @@ function prepareAttendanceChangesSimple_(timesByEmpDay, masterInfo, cfg, month, 
     return 'ca';
   };
 
-  // Duyệt qua TẤT CẢ nhân viên có dữ liệu trong raw data (không cần schedule)
-  for (const [emp, dayMap] of timesByEmpDay.entries()) {
+  // Tạo map để lưu tất cả nhân viên cần xử lý (từ master sheet và raw data)
+  const allEmployees = new Set();
+  // Thêm tất cả nhân viên từ master sheet
+  for (const emp of masterInfo.empToRow.keys()) {
+    allEmployees.add(emp);
+  }
+  // Thêm tất cả nhân viên từ raw data (nếu chưa có trong master)
+  for (const emp of timesByEmpDay.keys()) {
+    allEmployees.add(emp);
+  }
+
+  // Duyệt qua TẤT CẢ nhân viên (ưu tiên đọc từ master sheet, fallback sang raw data)
+  for (const emp of allEmployees) {
     // YÊU CẦU: Bỏ qua hoàn toàn nhân viên MH0008 (không xử lý trễ, không quên in/out)
     const empId = String(emp || '').toUpperCase();
     if (empId === 'MH0008') continue;
@@ -2224,25 +2317,37 @@ function prepareAttendanceChangesSimple_(timesByEmpDay, masterInfo, cfg, month, 
     const role = masterInfo.empToRole ? masterInfo.empToRole.get(emp) : undefined;
     const scheduleTemplate = getEmployeeSchedule_(emp, cfg, role);
 
-    // Duyệt qua TẤT CẢ các ngày có dữ liệu trong raw data
-    for (const [dayStr, timesSet] of dayMap.entries()) {
-      const timesArr = Array.from(timesSet);
+    // Duyệt qua TẤT CẢ các ngày từ 1 đến 31
+    for (let dayNum = 1; dayNum <= 31; dayNum++) {
+      const dayStr = String(dayNum);
+      let timesArr = [];
 
-      // Nếu không có times trong raw, thử lấy từ master sheet
-      if ((!timesArr || timesArr.length === 0) && masterInfo) {
+      // ƯU TIÊN: Đọc từ master sheet trước (dữ liệu đã chỉnh sửa thủ công)
+      if (masterInfo) {
         const col1 = masterInfo.colByDay.get(dayStr);
         if (col1) {
           const c0 = col1 - masterInfo.minDayCol;
-          const existing = masterInfo.dayBlock[r0][c0];
-          const extracted = extractTimesFromCell_(existing);
-          if (extracted && extracted.length) {
-            timesArr.push(...extracted);
+          if (c0 >= 0 && c0 < masterInfo.dayColsCount) {
+            const existing = masterInfo.dayBlock[r0][c0];
+            const extracted = extractTimesFromCell_(existing);
+            if (extracted && extracted.length) {
+              timesArr.push(...extracted);
+            }
           }
         }
       }
 
+      // FALLBACK: Nếu master sheet không có dữ liệu, mới lấy từ raw data
+      if ((!timesArr || timesArr.length === 0) && timesByEmpDay.has(emp)) {
+        const rawDayMap = timesByEmpDay.get(emp);
+        if (rawDayMap && rawDayMap.has(dayStr)) {
+          const timesSet = rawDayMap.get(dayStr);
+          timesArr = Array.from(timesSet);
+        }
+      }
+
+      // Bỏ qua nếu không có dữ liệu (không tính vắng, không check schedule)
       if (!timesArr || timesArr.length === 0) {
-        // Không có dữ liệu - bỏ qua (không tính vắng, không check schedule)
         continue;
       }
 
@@ -2299,6 +2404,7 @@ function prepareAttendanceChangesSimple_(timesByEmpDay, masterInfo, cfg, month, 
           if (lateRes.notes.length) {
             notesForDetail.push(...lateRes.notes);
             lateCount += lateRes.lateDelta;
+            offForgotCount += lateRes.offForgotDelta;
           }
         }
       }
