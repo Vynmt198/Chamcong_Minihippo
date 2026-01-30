@@ -297,6 +297,12 @@ function parseDayFromValue_(value) {
     const dn = Number(s);
     if (dn >= 1 && dn <= 31) return String(dn);
   }
+  // Fallback: header có thể là "5 - T5", "Ngày 5", "05" → trích số ngày đầu tiên 1-31
+  const m = s.match(/\b(\d{1,2})\b/);
+  if (m) {
+    const dn = Number(m[1]);
+    if (dn >= 1 && dn <= 31) return String(dn);
+  }
   return null;
 }
 
@@ -433,7 +439,9 @@ function buildTimesFromRawSheets_(rawFileId, rawSheetNames) {
 }
 
 // --- Helper: index master sheet and return useful info ---
-function buildMasterInfo_(masterSh, masterEmpCol, masterHeaderRow) {
+// dayColMin, dayColMax (optional): chỉ lấy cột ngày trong khoảng [dayColMin, dayColMax] (1-based).
+// Ví dụ: dữ liệu vân tay ở cột AJ–BN thì truyền 36, 66 để tránh nhầm với khối cột khác có header 1..31.
+function buildMasterInfo_(masterSh, masterEmpCol, masterHeaderRow, dayColMin, dayColMax) {
   const lastEmpRow = findLastEmployeeRow_(masterSh, masterEmpCol);
   const empColVals = masterSh.getRange(1, masterEmpCol, lastEmpRow, 1).getValues().flat();
   const empToRow = new Map();
@@ -446,9 +454,10 @@ function buildMasterInfo_(masterSh, masterEmpCol, masterHeaderRow) {
   const colByDay = new Map();
   let minDayCol = null, maxDayCol = null;
   for (let c = 0; c < header.length; c++) {
+    const col1 = c + 1;
+    if (dayColMin != null && dayColMax != null && (col1 < dayColMin || col1 > dayColMax)) continue;
     const day = parseDayFromValue_(header[c]);
     if (day) {
-      const col1 = c + 1;
       colByDay.set(day, col1);
       if (minDayCol === null || col1 < minDayCol) minDayCol = col1;
       if (maxDayCol === null || col1 > maxDayCol) maxDayCol = col1;
@@ -551,16 +560,8 @@ function getEmployeeSchedule_(emp, baseCfg, role) {
 
   // Role-based override (column F / FULL/PART)
   if (roleStr) {
-    if (roleStr.includes('QL') || roleStr.includes('QUAN') || roleStr.includes('MANAGER')) {
-      const t = SPECIAL_SCHEDULES.managers.template;
-      return {
-        useHalfDaySplit: true,
-        morning: { start: t.morningStart, end: t.morningEnd },
-        afternoon: { start: FIXED_AFTERNOON_START, end: t.afternoonEnd },
-        cutoff: baseCfg.cutoff || SPECIAL_SCHEDULES.default.cutoff,
-        lateThreshold: baseCfg.lateThreshold || SPECIAL_SCHEDULES.default.lateThreshold
-      };
-    }
+    // IMPORTANT: không suy luận quản lý từ roleStr vì dễ bị sai dữ liệu/nhầm cột role → gây sót lỗi trễ.
+    // Quản lý chỉ được override bằng danh sách mã (SPECIAL_SCHEDULES.managers.ids) ở phía dưới.
 
     if (roleStr.includes('PART')) {
       const t = SPECIAL_SCHEDULES.parttime.template || SPECIAL_SCHEDULES.default;
@@ -1220,25 +1221,28 @@ function prepareAttendanceChanges_(timesByEmpDay, masterInfo, cfg, month, schedu
 /**
  * Helper: phát hiện lỗi QUÊN CHECK IN/OUT cho 1 session (simple mode)
  * Trả về: { notes: string[], offForgotDelta: number }
+ * Đồng bộ với highlight: báo lỗi khi có bằng chứng session (có times hoặc có in/out).
  */
 function handleMissingCheckInOutSimple_(session, human, dayStr, month) {
   const notes = [];
   let offForgotDelta = 0;
 
-  // CHỈ báo lỗi khi session thực sự có làm (có ít nhất 1 mốc thời gian hợp lệ)
-  // Nếu session không có mốc thời gian nào (times.length === 0), coi như nhân viên không làm ca đó, không báo lỗi
-  const hasTimes = session && Array.isArray(session.times) && session.times.length > 0;
-  if (!hasTimes) {
-    return { notes, offForgotDelta }; // Không có mốc thời gian → không làm ca này → không báo lỗi
+  if (!session) return { notes, offForgotDelta };
+
+  // Có bằng chứng session: có ít nhất 1 mốc thời gian HOẶC có in/out (để không sót quên check in ca chiều khi chỉ có out)
+  const hasTimes = Array.isArray(session.times) && session.times.length > 0;
+  const hasInOrOut = session.in != null || session.out != null;
+  if (!hasTimes && !hasInOrOut) {
+    return { notes, offForgotDelta };
   }
 
-  // Phát hiện lỗi quên check-in (chỉ khi có mốc thời gian nhưng thiếu check-in)
+  // Quên check-in: thiếu in (có out hoặc có times trong ca đó)
   if (session.missingIn && session.in === null) {
     notes.push(`- Quên check in ${human} ${dayStr}/${month}`);
     offForgotDelta++;
   }
-  // Phát hiện lỗi quên check-out (chỉ khi đã có check-in nhưng thiếu check-out)
-  else if (session.missingOut && session.in !== null && session.out === null) {
+  // Quên check-out: có in nhưng thiếu out
+  else if (session.missingOut && session.in != null && session.out === null) {
     notes.push(`- Quên check out ${human} ${dayStr}/${month}`);
     offForgotDelta++;
   }
@@ -1258,10 +1262,12 @@ function handleLateSimple_(session, human, dayStr, month, masterInfo, r0, emp, s
   let lateDelta = 0;
   let offForgotDelta = 0;
 
-  // CHỈ xét TRỄ khi session có đủ cả check-in và check-out.
-  // Trường hợp chỉ có 1 mốc (quên check-out) thì chỉ ghi "Quên check out", không ghi "Trễ" để tránh sai.
-  if (session && session.in && session.out && session.lateMinutes && session.lateMinutes > 0) {
-    const lateMinutes = Math.round(session.lateMinutes);
+  // Xét TRỄ khi có check-in và lateMinutes > 0 (đồng bộ với highlight: không bắt buộc có session.out).
+  // Trường hợp chỉ có check-in (quên check-out) vẫn ghi note trễ nếu check-in trễ, để khớp với ô đã tô đỏ.
+  // Dùng Number() để tránh sót khi lateMinutes là số thực/string từ computeSessionsBySchedule_
+  const lateMinNum = Number(session && session.lateMinutes);
+  if (session && session.in && !isNaN(lateMinNum) && lateMinNum > 0) {
+    const lateMinutes = Math.round(lateMinNum);
     const threshold = 30;
 
     // YÊU CẦU: Trễ > 30 phút LUÔN quy thành lỗi QUÊN CHECK IN (ghi cột W), KHÔNG ghi cột S (lỗi trễ).
@@ -1490,10 +1496,13 @@ function highlightProblematicCells() {
   const RAW_SHEETS = ["L4_HH"];
   const cfg = { morningStart: "08:30", afternoonStart: "13:15", cutoff: "12:00", lateThreshold: 30, maxTimesThreshold: 4 };
 
+  // Dữ liệu vân tay nằm ở cột AJ (36) đến BN (66), nhân viên từ hàng 2. Chỉ lấy cột ngày trong khối này để tô đúng ô.
+  const FINGERPRINT_DAY_COL_MIN = 36;  // AJ
+  const FINGERPRINT_DAY_COL_MAX = 66;  // BN
   Logger.log("1) Loading data...");
   const timesByEmpDay = buildTimesFromRawSheets_(RAW_FILE_ID, RAW_SHEETS);
   const masterSh = SpreadsheetApp.openById(MASTER_FILE_ID).getSheetByName(MASTER_SHEET_NAME);
-  const masterInfo = buildMasterInfo_(masterSh, 2, 1);
+  const masterInfo = buildMasterInfo_(masterSh, 2, 1, FINGERPRINT_DAY_COL_MIN, FINGERPRINT_DAY_COL_MAX);
   const month = parseMonthFromSheetName_(MASTER_SHEET_NAME) || 12;
 
   const problematicCells = [];
@@ -2269,25 +2278,12 @@ function prepareAttendanceChangesSimple_(timesByEmpDay, masterInfo, cfg, month, 
     return 'ca';
   };
 
-  // Tạo map để lưu tất cả nhân viên cần xử lý (từ master sheet và raw data)
-  const allEmployees = new Set();
-  // Thêm tất cả nhân viên từ master sheet
-  for (const emp of masterInfo.empToRow.keys()) {
-    allEmployees.add(emp);
-  }
-  // Thêm tất cả nhân viên từ raw data (nếu chưa có trong master)
-  for (const emp of timesByEmpDay.keys()) {
-    allEmployees.add(emp);
-  }
-
-  // Duyệt qua TẤT CẢ nhân viên (ưu tiên đọc từ master sheet, fallback sang raw data)
-  for (const emp of allEmployees) {
+  // Duyệt đúng theo master sheet (cùng cách với highlight) để đọc cùng ô, tránh sai sót do key/casing từ raw.
+  for (const [emp, r1] of masterInfo.empToRow.entries()) {
     // YÊU CẦU: Bỏ qua hoàn toàn nhân viên MH0008 (không xử lý trễ, không quên in/out)
     const empId = String(emp || '').toUpperCase();
     if (empId === 'MH0008') continue;
 
-    const r1 = masterInfo.empToRow.get(emp);
-    if (!r1) continue; // employee not in master attendance sheet
     const r0 = r1 - 1;
 
     let notesForDetail = [];
@@ -2365,9 +2361,11 @@ function prepareAttendanceChangesSimple_(timesByEmpDay, masterInfo, cfg, month, 
         // Bỏ qua các session không hợp lệ
         if (sessionName === '_problematic' || sessionName === '_timesCount') continue;
 
-        // Với chế độ đơn giản (không có đăng ký ca), nếu session không có bất kỳ mốc giờ nào
-        // thì coi như nhân sự KHÔNG LÀM ca đó, không ghi lỗi quên check in/out
-        if (!session || !Array.isArray(session.times) || session.times.length === 0) {
+        // Với chế độ đơn giản: bỏ qua session không có dữ liệu. Nhưng vẫn xử lý session có in/out/lateMinutes
+        // (phòng edge case session.times rỗng nhưng in/out đã được set, ví dụ quản lý 4 mốc)
+        const hasTimes = session && Array.isArray(session.times) && session.times.length > 0;
+        const hasInOutOrLate = session && (session.in != null || session.out != null || (typeof session.lateMinutes === 'number' && session.lateMinutes > 0));
+        if (!session || (!hasTimes && !hasInOutOrLate)) {
           continue;
         }
 
@@ -2430,10 +2428,12 @@ function applyAttendance(opts) {
   const timesByEmpDay = buildTimesFromRawSheets_(RAW_FILE_ID, RAW_SHEETS);
   Logger.log('   Loaded times for ' + timesByEmpDay.size + ' employees');
 
-  // Load master sheet info
+  // Load master sheet info - dùng cùng khối cột vân tay AJ-BN (36-66) như highlight để đọc đúng ô và ghi note đúng hàng
+  const FINGERPRINT_DAY_COL_MIN = 36;  // AJ
+  const FINGERPRINT_DAY_COL_MAX = 66; // BN
   Logger.log('2) Loading master sheet info...');
   const masterSh = SpreadsheetApp.openById(MASTER_FILE_ID).getSheetByName(MASTER_SHEET_NAME);
-  const masterInfo = buildMasterInfo_(masterSh, 2, 1);
+  const masterInfo = buildMasterInfo_(masterSh, 2, 1, FINGERPRINT_DAY_COL_MIN, FINGERPRINT_DAY_COL_MAX);
   const month = parseMonthFromSheetName_(MASTER_SHEET_NAME) || 12;
   const headerMap = findHeaderCols_(masterInfo.header);
 
@@ -2467,7 +2467,12 @@ function applyAttendance(opts) {
   // apply changes into arrays
   for (const [r0, v] of changes.entries()) {
     const allNotes = v.notes || [];
-    const lateNotes = allNotes.filter(n => typeof n === 'string' && n.toLowerCase().includes('trễ'));
+    // Cột S: chỉ ghi note TRỄ dưới/đúng 30 phút; loại note "trễ từ 30 phút trở lên" (ghi vào W)
+    const lateNotes = allNotes.filter(n => {
+      if (typeof n !== 'string') return false;
+      const nl = (n || '').toLowerCase();
+      return nl.includes('trễ') && !nl.includes('trễ từ 30 phút trở lên');
+    });
     // Missing notes (cột W): gồm các lỗi "quên check" và các case trễ bị quy thành lỗi trên cột W (>=30p theo wording)
     const missingNotes = allNotes.filter(n => {
       if (typeof n !== 'string') return false;
@@ -2514,7 +2519,11 @@ function applyAttendance(opts) {
     const slice = changeEntries.slice(0, testRows);
     slice.forEach(([r0, v]) => {
       const rowNum = r0 + 1;
-      const lateNotes = (v.notes || []).filter(n => typeof n === 'string' && n.toLowerCase().includes('trễ'));
+      const lateNotes = (v.notes || []).filter(n => {
+        if (typeof n !== 'string') return false;
+        const nl = (n || '').toLowerCase();
+        return nl.includes('trễ') && !nl.includes('trễ từ 30 phút trở lên');
+      });
       const missingNotes = (v.notes || []).filter(n => {
         if (typeof n !== 'string') return false;
         const nl = n.toLowerCase();
@@ -4005,19 +4014,19 @@ function prepareOnlAttendanceChangesFromSheet_(masterInfo, cfg, month, mode) {
           } else if (session.in != null && session.out == null) {
             notesForDetail.push(`- Quên check out ${human} ${dayStrFormatted} (ONL)`);
             onlErrorCount++;
-          } else if (session.in && session.out && session.lateMinutes > 0) {
-            // Trễ >= 30 phút: quy thành quên check in (chỉ xử lý trong mode missing)
+          } else if (session.in && (typeof session.lateMinutes === 'number' && session.lateMinutes > 0)) {
+            // Trễ >= 30 phút: quy thành quên check in (chỉ xử lý trong mode missing). Đồng bộ với highlight: không bắt buộc có session.out.
             const lateMin = Math.round(session.lateMinutes);
             const threshold = cfg.lateThreshold || 30;
             if (lateMin >= threshold) {
-              notesForDetail.push(`- Quên check in (do check in muộn ${lateMin} phút >= 30p) ${human} ${dayStrFormatted} (ONL)`);
+              notesForDetail.push(`- Check in trễ từ 30 phút trở lên (${lateMin} phút) ${human} ${dayStrFormatted} (ONL)`);
               onlErrorCount++;
             }
           }
         }
 
-        if (runLate && session.in && session.out && session.lateMinutes > 0) {
-          // Chỉ xử lý trễ < 30 phút (trễ >= 30 đã được xử lý như quên check in ở mode missing)
+        if (runLate && session.in && (typeof session.lateMinutes === 'number' && session.lateMinutes > 0)) {
+          // Chỉ xử lý trễ < 30 phút (trễ >= 30 đã được xử lý ở mode missing). Đồng bộ với highlight: không bắt buộc có session.out.
           const lateMin = Math.round(session.lateMinutes);
           const threshold = cfg.lateThreshold || 30;
           
@@ -4025,7 +4034,6 @@ function prepareOnlAttendanceChangesFromSheet_(masterInfo, cfg, month, mode) {
           if (lateMin > 0 && lateMin < threshold) {
             notesForDetail.push(`- Check in trễ dưới 30 phút (${lateMin} phút) ${human} ${dayStrFormatted} (ONL)`);
           }
-          // Trễ >= 30 phút: KHÔNG tạo note ở đây (đã được xử lý như quên check in ở mode missing)
         }
       }
     }
@@ -4040,7 +4048,7 @@ function prepareOnlAttendanceChangesFromSheet_(masterInfo, cfg, month, mode) {
 
 /**
  * Phân tích dữ liệu ONL form để phát hiện lỗi quên check in/out và trễ
- * @param {Array} formData - Dữ liệu từ Google Form (loadOnlFormData_)
+ * @param {Array} formData - Dữ liệu từ Google Form (loadOnlFormData_)y
  * @param {Map} nameToEmpMap - Map từ tên sang mã nhân viên
  * @param {Map} scheduleMap - Map đăng ký ca ONL (loadOnlScheduleRegistrations_)
  * @param {Object} cfg - Config (morningStart, afternoonStart, lateThreshold)
@@ -4129,9 +4137,9 @@ function prepareOnlAttendanceChanges_(formData, nameToEmpMap, scheduleMap, maste
         const dayNum = parseInt(dayStr, 10);
         const dayStrFormatted = `${dayNum}/${month}`;
 
-        // Tính lateMinutes trước để dùng cho cả missing và late mode
+        // Tính lateMinutes trước để dùng cho cả missing và late mode. Đồng bộ với highlight: tính khi có session.in (không bắt buộc session.out).
         let lateMinutes = 0;
-        if (session.in && session.out) {
+        if (session.in) {
           const checkInTime = session.in;
           const checkInMin = checkInTime.getHours() * 60 + checkInTime.getMinutes();
 
@@ -4165,17 +4173,16 @@ function prepareOnlAttendanceChanges_(formData, nameToEmpMap, scheduleMap, maste
             // Có check in nhưng quên check out
             notesForDetail.push(`- Quên check out ${human} ${dayStrFormatted} (ONL)`);
             onlErrorCount++;
-          } else if (session.in && session.out && lateMinutesRounded > threshold) {
-            // Trễ >= 30 phút: quy thành quên check in (chỉ xử lý trong mode missing)
+          } else if (session.in && lateMinutesRounded > threshold) {
+            // Trễ >= 30 phút: quy thành quên check in (chỉ xử lý trong mode missing). Đồng bộ với highlight: không bắt buộc session.out.
             notesForDetail.push(`- Check in trễ từ 30 phút trở lên (${lateMinutesRounded} phút) ${human} ${dayStrFormatted} (ONL)`);
             onlErrorCount++;
           }
         }
 
-        // 2) Xử lý TRỄ CHECK-IN (tùy theo mode)
-        // Chỉ xử lý trễ < 30 phút (trễ >= 30 đã được xử lý như quên check in ở mode missing)
-        if (runLate && session.in && session.out && lateMinutesRounded > 0 && lateMinutesRounded <= threshold) {
-          // Trễ < 30 phút (bao gồm cả = 30 phút) là lỗi TRỄ, ghi cột S
+        // 2) Xử lý TRỄ CHECK-IN (tùy theo mode). Đồng bộ với highlight: không bắt buộc session.out.
+        if (runLate && session.in && lateMinutesRounded > 0 && lateMinutesRounded <= threshold) {
+          // Trễ <= 30 phút (bao gồm cả = 30 phút) là lỗi TRỄ, ghi cột S
           notesForDetail.push(`- Check in trễ dưới hoặc bằng 30 phút (${lateMinutesRounded} phút) ${human} ${dayStrFormatted} (ONL)`);
         }
       }
@@ -5230,19 +5237,19 @@ function prepareOffAttendanceChangesFromSheet_(masterInfo, cfg, month, mode) {
           } else if (session.in != null && session.out == null) {
             notesForDetail.push(`- Quên check out ${human} ${dayStrFormatted} (OFF ngoài)`);
             offErrorCount++;
-          } else if (session.in && session.out && session.lateMinutes > 0) {
-            // Trễ >= 30 phút: quy thành quên check in (chỉ xử lý trong mode missing)
+          } else if (session.in && (typeof session.lateMinutes === 'number' && session.lateMinutes > 0)) {
+            // Trễ >= 30 phút: quy thành quên check in (chỉ xử lý trong mode missing). Đồng bộ với highlight: không bắt buộc có session.out.
             const lateMin = Math.round(session.lateMinutes);
             const threshold = cfg.lateThreshold || 30;
             if (lateMin >= threshold) {
-              notesForDetail.push(`- Quên check in (do check in muộn ${lateMin} phút >= 30p) ${human} ${dayStrFormatted} (OFF ngoài)`);
+              notesForDetail.push(`- Check in trễ từ 30 phút trở lên (${lateMin} phút) ${human} ${dayStrFormatted} (OFF ngoài)`);
               offErrorCount++;
             }
           }
         }
 
-        if (runLate && session.in && session.out && session.lateMinutes > 0) {
-          // Chỉ xử lý trễ < 30 phút (trễ >= 30 đã được xử lý như quên check in ở mode missing)
+        if (runLate && session.in && (typeof session.lateMinutes === 'number' && session.lateMinutes > 0)) {
+          // Chỉ xử lý trễ < 30 phút (trễ >= 30 đã được xử lý ở mode missing). Đồng bộ với highlight: không bắt buộc có session.out.
           const lateMin = Math.round(session.lateMinutes);
           const threshold = cfg.lateThreshold || 30;
           
@@ -5354,9 +5361,9 @@ function prepareOffAttendanceChanges_(formData, nameToEmpMap, scheduleMap, maste
         const dayNum = parseInt(dayStr, 10);
         const dayStrFormatted = `${dayNum}/${month}`;
 
-        // Tính lateMinutes trước để dùng cho cả missing và late mode
+        // Tính lateMinutes trước để dùng cho cả missing và late mode. Đồng bộ với highlight: tính khi có session.in (không bắt buộc session.out).
         let lateMinutes = 0;
-        if (session.in && session.out) {
+        if (session.in) {
           const checkInTime = session.in;
           const checkInMin = checkInTime.getHours() * 60 + checkInTime.getMinutes();
 
@@ -5390,16 +5397,15 @@ function prepareOffAttendanceChanges_(formData, nameToEmpMap, scheduleMap, maste
             // Có check in nhưng quên check out
             notesForDetail.push(`- Quên check out ${human} ${dayStrFormatted} (OFF ngoài)`);
             offErrorCount++;
-          } else if (session.in && session.out && lateMinutesRounded > threshold) {
-            // Trễ >= 30 phút: quy thành quên check in (chỉ xử lý trong mode missing)
+          } else if (session.in && lateMinutesRounded > threshold) {
+            // Trễ >= 30 phút: quy thành quên check in (chỉ xử lý trong mode missing). Đồng bộ với highlight: không bắt buộc session.out.
             notesForDetail.push(`- Check in trễ từ 30 phút trở lên (${lateMinutesRounded} phút) ${human} ${dayStrFormatted} (OFF ngoài)`);
             offErrorCount++;
           }
         }
 
-        // 2) Xử lý TRỄ CHECK-IN (tùy theo mode)
-        // Chỉ xử lý trễ < 30 phút (trễ >= 30 đã được xử lý như quên check in ở mode missing)
-        if (runLate && session.in && session.out && lateMinutesRounded > 0 && lateMinutesRounded <= threshold) {
+        // 2) Xử lý TRỄ CHECK-IN (tùy theo mode). Đồng bộ với highlight: không bắt buộc session.out.
+        if (runLate && session.in && lateMinutesRounded > 0 && lateMinutesRounded <= threshold) {
           // Trễ <= 30 phút (bao gồm cả = 30 phút) là lỗi TRỄ, ghi cột S
           notesForDetail.push(`- Check in trễ dưới hoặc bằng 30 phút (${lateMinutesRounded} phút) ${human} ${dayStrFormatted} (OFF ngoài)`);
         }
