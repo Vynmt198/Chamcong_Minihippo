@@ -1223,7 +1223,7 @@ function prepareAttendanceChanges_(timesByEmpDay, masterInfo, cfg, month, schedu
  * Trả về: { notes: string[], offForgotDelta: number }
  * Đồng bộ với highlight: báo lỗi khi có bằng chứng session (có times hoặc có in/out).
  */
-function handleMissingCheckInOutSimple_(session, human, dayStr, month) {
+function handleMissingCheckInOutSimple_(session, human, dayStr, month, scheduleTemplate, sessionName, totalTimesInDay) {
   const notes = [];
   let offForgotDelta = 0;
 
@@ -1235,6 +1235,50 @@ function handleMissingCheckInOutSimple_(session, human, dayStr, month) {
   if (!hasTimes && !hasInOrOut) {
     return { notes, offForgotDelta };
   }
+
+  // ===== TRƯỜNG HỢP ĐẶC BIỆT: ĐỦ ≥4 MỐC TRONG NGÀY NHƯNG BỊ COI LÀ QUÊN CHECK IN CA =====
+  // Điều kiện:
+  // - Cả ngày có đủ ≥ 4 mốc (điển hình 4 mốc: 2 sáng, 2 chiều)
+  // - Session hiện tại bị đánh dấu missingIn & in === null (logic cũ coi là "Quên check in")
+  // → Chuyển thành "Check in trễ từ 30 phút trở lên" (ghi ở cột W)
+  if (
+    typeof totalTimesInDay === 'number' &&
+    totalTimesInDay >= 4 &&
+    session.missingIn &&
+    session.in === null &&
+    Array.isArray(session.times) &&
+    session.times.length > 0
+  ) {
+    // Xác định giờ bắt đầu ca theo scheduleTemplate
+    let startStr = null;
+    if (sessionName === 'morning') {
+      startStr = scheduleTemplate && scheduleTemplate.morning && scheduleTemplate.morning.start;
+    } else if (sessionName === 'afternoon') {
+      startStr = scheduleTemplate && scheduleTemplate.afternoon && scheduleTemplate.afternoon.start;
+    }
+
+    const firstTimeStr = session.times
+      .slice()
+      .sort((a, b) => (timeStrToMinutes_(a) || 0) - (timeStrToMinutes_(b) || 0))[0];
+
+    const startMin = startStr != null ? timeStrToMinutes_(startStr) : null;
+    const firstMin = firstTimeStr != null ? timeStrToMinutes_(firstTimeStr) : null;
+
+    if (startMin != null && firstMin != null) {
+      const diff = firstMin - startMin;
+      const threshold = 30;
+
+      if (diff >= threshold) {
+        // Ghi lỗi "trễ từ 30 phút trở lên" nhưng vẫn tính vào nhóm missing (cột W)
+        notes.push(`- Check in trễ từ 30 phút trở lên (${diff} phút) ${human} ${dayStr}/${month}`);
+        offForgotDelta++;
+        return { notes, offForgotDelta };
+      }
+    }
+    // Nếu không tính được diff hợp lệ → rơi xuống logic cũ phía dưới
+  }
+
+  // ===== LOGIC CŨ (giữ nguyên cho mọi trường hợp còn lại) =====
 
   // Quên check-in: thiếu in (có out hoặc có times trong ca đó)
   if (session.missingIn && session.in === null) {
@@ -1297,6 +1341,25 @@ function handleLateSimple_(session, human, dayStr, month, masterInfo, r0, emp, s
       // Trễ <= 30 phút (bao gồm cả = 30 phút): vẫn là lỗi TRỄ, ghi cột S và cộng lateCount (cột Q)
       notes.push(`- Check in trễ dưới 30 phút (${lateMinutes} phút) ${human} ${dayStr}/${month}`);
       lateDelta++;
+      // Ghi vào problematicCells để applyAttendance có thể đồng bộ note nếu bị sót (ô tô đỏ nhưng không có note)
+      if (problematicCells && masterInfo) {
+        const col1 = masterInfo.colByDay.get(dayStr);
+        if (col1) {
+          const c0 = col1 - masterInfo.minDayCol;
+          if (c0 >= 0 && c0 < masterInfo.dayColsCount) {
+            problematicCells.push({
+              r0,
+              c0,
+              emp,
+              dayStr,
+              type: 'late',
+              sessionName: sessionName,
+              lateMinutes: session.lateMinutes,
+              checkInTime: session.in
+            });
+          }
+        }
+      }
     }
   }
 
@@ -1304,57 +1367,41 @@ function handleLateSimple_(session, human, dayStr, month, masterInfo, r0, emp, s
 }
 
 /**
- * Tính số ca off vân tay cho một nhân viên trong một khoảng ngày cụ thể (tuần)
- * Logic: 
- * - Nếu có check in nhưng quên check out = 1 ca off
- * - Nếu có check out nhưng quên check in = 1 ca off  
- * - Nếu có cả check in và check out = không tính (ca thành công)
- * - Nếu không có gì = không tính
+ * Đếm số ca làm trong tháng cho một nhân viên từ dữ liệu vân tay.
+ * Dùng cho cột BU (TỔNG ca off vân tay) = số lượng ca làm trong tháng.
+ * Mỗi ca được tính nếu có bằng chứng đi làm: có check-in HOẶC check-out HOẶC có ít nhất một mốc thời gian trong ca
+ * (quên check in/out vẫn tính 1 ca vì họ vẫn có đi làm).
  * @param {number} r0 - Row index (0-based) của nhân viên trong master sheet
- * @param {number} startDay - Ngày bắt đầu tuần (1-31)
- * @param {number} endDay - Ngày kết thúc tuần (1-31)
- * @param {Object} masterInfo - Thông tin master sheet
+ * @param {Object} masterInfo - Thông tin master sheet (đã dùng fingerprint range 36-66)
  * @param {Object} schedule - Lịch làm việc của nhân viên
  * @param {Object} cfg - Config attendance
- * @return {number} - Tổng số ca off vân tay trong tuần
+ * @return {number} - Tổng số ca làm trong tháng (sáng + chiều)
  */
-function calculateOffVanTayCountForWeek_(r0, startDay, endDay, masterInfo, schedule, cfg) {
-  let totalOffCount = 0;
-
-  // Duyệt qua tất cả các ngày trong tuần
-  for (let day = startDay; day <= endDay; day++) {
+function countCompleteSessionsInMonth_(r0, masterInfo, schedule, cfg) {
+  let total = 0;
+  for (let day = 1; day <= 31; day++) {
     const dayStr = String(day);
     const col1 = masterInfo.colByDay.get(dayStr);
-    if (!col1) continue; // Ngày này không có trong header
-
+    if (!col1) continue;
     const c0 = col1 - masterInfo.minDayCol;
     if (c0 < 0 || c0 >= masterInfo.dayColsCount) continue;
 
-    // Lấy dữ liệu từ dayBlock (đã merge từ raw và master)
     const existing = masterInfo.dayBlock[r0][c0];
     let times = extractTimesFromCell_(existing);
     if (!times || !times.length) times = extractTimes_(String(existing || ''));
-
-    if (!times || times.length === 0) continue; // Không có dữ liệu = không tính
+    if (!times || times.length === 0) continue;
 
     const sessionsMap = computeSessionsBySchedule_(times, schedule, null);
-
-    // Đếm số ca có vấn đề (missingIn hoặc missingOut)
     for (const [sessionName, session] of Object.entries(sessionsMap)) {
-      // Chỉ tính nếu có ít nhất 1 trong 2 (check in hoặc check out) nhưng thiếu cái kia
-      if (session.missingIn && !session.missingOut) {
-        // Có check out nhưng quên check in = 1 ca off
-        totalOffCount++;
-      } else if (session.missingOut && !session.missingIn) {
-        // Có check in nhưng quên check out = 1 ca off
-        totalOffCount++;
-      }
-      // Nếu cả 2 đều có (missingIn=false, missingOut=false) = ca thành công, không tính
-      // Nếu cả 2 đều thiếu (missingIn=true, missingOut=true) = không có dữ liệu, không tính
+      if (sessionName === '_problematic' || sessionName === '_timesCount') continue;
+      if (!session) continue;
+      // Có bằng chứng ca: đủ in+out, hoặc quên check in (có out), hoặc quên check out (có in), hoặc có times trong ca
+      const hasInOrOut = session.in != null || session.out != null;
+      const hasTimes = Array.isArray(session.times) && session.times.length > 0;
+      if (hasInOrOut || hasTimes) total++;
     }
   }
-
-  return totalOffCount;
+  return total;
 }
 
 function findHeaderCols_(headerRow) {
@@ -1430,26 +1477,14 @@ function findHeaderCols_(headerRow) {
     }
   }
 
-  // vân tay tuần columns (BP-BT) - tìm các cột có "van tay tuan" và parse khoảng ngày
-  map.vanTayTuanCols = [];
+  // Cột BU (73) - TỔNG ca off vân tay = số ca làm trong tháng (đếm từ dữ liệu vân tay)
+  map.totalCaOffVanTayCol = null;
+  if (headers.length >= 73) map.totalCaOffVanTayCol = 73; // BU
   headers.forEach((h, idx) => {
-    if (h.n.includes("van tay tuan") || h.n.includes("vân tay tuần")) {
-      // Parse khoảng ngày từ tiêu đề (ví dụ: "1-7", "8-14", "15-21", "22-28", "29-31")
-      const dayRangeMatch = h.n.match(/(\d{1,2})\s*-\s*(\d{1,2})/);
-      if (dayRangeMatch) {
-        const startDay = Number(dayRangeMatch[1]);
-        const endDay = Number(dayRangeMatch[2]);
-        map.vanTayTuanCols.push({
-          col: idx + 1,
-          startDay: startDay,
-          endDay: endDay,
-          headerText: h.raw
-        });
-      }
+    if ((h.n.includes("tong") || h.n.includes("tổng")) && h.n.includes("ca") && (h.n.includes("van tay") || h.n.includes("vân tay"))) {
+      map.totalCaOffVanTayCol = idx + 1;
     }
   });
-  // Sắp xếp theo startDay để đảm bảo thứ tự
-  map.vanTayTuanCols.sort((a, b) => a.startDay - b.startDay);
 
   // totals and flags
   headers.forEach((h, idx) => {
@@ -2370,10 +2405,11 @@ function prepareAttendanceChangesSimple_(timesByEmpDay, masterInfo, cfg, month, 
         }
 
         const human = humanForSession(sessionName);
+        const totalTimesInDay = Array.isArray(timesArr) ? timesArr.length : 0;
 
         // 1) Xử lý QUÊN CHECK IN/OUT (tùy theo mode)
         if (runMissing) {
-          const missingRes = handleMissingCheckInOutSimple_(session, human, dayStr, month);
+          const missingRes = handleMissingCheckInOutSimple_(session, human, dayStr, month, scheduleTemplate, sessionName, totalTimesInDay);
           if (missingRes.notes.length) {
             notesForDetail.push(...missingRes.notes);
             offForgotCount += missingRes.offForgotDelta;
@@ -2442,8 +2478,31 @@ function applyAttendance(opts) {
   const mode = opts.mode || 'both'; // 'both' | 'late' | 'missing'
   const result = prepareAttendanceChangesSimple_(timesByEmpDay, masterInfo, cfg, month, mode);
 
-  const changes = result.changes || new Map();
+  let changes = result.changes || new Map();
   const problematicCells = result.problematicCells || [];
+
+  // Đồng bộ note trễ từ problematicCells vào changes để không sót (ô tô đỏ nhưng không có note, ví dụ MH0029)
+  const runLateSync = (mode === 'both' || mode === 'late');
+  if (runLateSync && problematicCells.length > 0) {
+    const humanMap = { morning: 'ca sáng', afternoon: 'ca chiều', evening: 'ca tối' };
+    for (const p of problematicCells) {
+      if (p.type !== 'late' && p.type !== 'missing_in_over_30') continue;
+      const r0 = p.r0;
+      const human = humanMap[p.sessionName] || 'ca';
+      const lateMin = Math.round(Number(p.lateMinutes) || 0);
+      const threshold = 30;
+      const noteStr = lateMin > threshold
+        ? `- Check in trễ từ 30 phút trở lên (${lateMin} phút) ${human} ${p.dayStr}/${month}`
+        : `- Check in trễ dưới 30 phút (${lateMin} phút) ${human} ${p.dayStr}/${month}`;
+      if (!changes.has(r0)) changes.set(r0, { notes: [], lateCount: 0, offForgotCount: 0 });
+      const entry = changes.get(r0);
+      const alreadyHas = entry.notes.some(n => typeof n === 'string' && n.includes(p.dayStr) && n.includes(human));
+      if (!alreadyHas) {
+        entry.notes.push(noteStr);
+        if (lateMin > threshold) entry.offForgotCount = (entry.offForgotCount || 0) + 1; else entry.lateCount = (entry.lateCount || 0) + 1;
+      }
+    }
+  }
 
   Logger.log('   Computed changes=' + changes.size + ' problematic=' + problematicCells.length);
 
@@ -2490,13 +2549,14 @@ function applyAttendance(opts) {
       const prev = String(newNote[r0] || '').trim();
       newNote[r0] = (prev ? prev + '\n' : '') + missingNotes.join('\n');
     }
-    // Cột Q (TỔNG TRỄ): đếm số lượng note TRỄ thực tế trong cột S, không cộng dồn từ lần chạy trước
+    // Cột Q (TỔNG TRỄ OFF): đếm đúng số lỗi trễ chấm công vân tay = số dòng note trong cột S
     if (headerMap.totalLateCol) {
       newTotalLate[r0] = lateNotes.length;
     }
+    // Cột U (OFF QUÊN CHECK IN/OUT/TRỄ >=30p): đếm đúng số lỗi = số dòng note trong cột W (sau khi đã cập nhật)
     if (headerMap.offForgotCol) {
-      const prev = Number(newOffForgot[r0] || 0);
-      newOffForgot[r0] = prev + Number(v.offForgotCount || 0);
+      const wContent = String(newNote[r0] || '').trim();
+      newOffForgot[r0] = wContent ? wContent.split(/\n/).filter(line => line.trim()).length : 0;
     }
     // Bỏ xử lý onlForgotCol - không sử dụng nữa
   }
@@ -2533,13 +2593,18 @@ function applyAttendance(opts) {
         masterSh.getRange(rowNum, headerMap.detail2Col).setValue(lateNotes.length ? lateNotes.join('\n') : '');
       }
       const noteColToWrite = headerMap.noteCol || headerMap.detail3Col || headerMap.detail2Col;
+      let newWContent = String(noteArr[r0] || '').trim();
       if (noteColToWrite && missingNotes.length) {
-        const prev = String(noteArr[r0] || '').trim();
-        masterSh.getRange(rowNum, noteColToWrite).setValue((prev ? prev + '\n' : '') + missingNotes.join('\n'));
+        newWContent = (newWContent ? newWContent + '\n' : '') + missingNotes.join('\n');
+        masterSh.getRange(rowNum, noteColToWrite).setValue(newWContent);
       }
-      // Cột Q (TỔNG TRỄ): đếm số lượng note TRỄ thực tế trong cột S, không cộng dồn từ lần chạy trước
+      // Cột Q (TỔNG TRỄ OFF): đếm đúng số lỗi trễ = số dòng trong cột S
       if (headerMap.totalLateCol) masterSh.getRange(rowNum, headerMap.totalLateCol).setValue(lateNotes.length);
-      if (headerMap.offForgotCol) masterSh.getRange(rowNum, headerMap.offForgotCol).setValue(Number(offForgotArr[r0] || 0) + Number(v.offForgotCount || 0));
+      // Cột U (OFF QUÊN CHECK IN/OUT/TRỄ >=30p): đếm đúng số lỗi = số dòng trong cột W
+      if (headerMap.offForgotCol) {
+        const uCount = newWContent ? newWContent.split(/\n/).filter(line => line.trim()).length : 0;
+        masterSh.getRange(rowNum, headerMap.offForgotCol).setValue(uCount);
+      }
       Logger.log(`WROTE row ${rowNum}`);
     });
     return { changesCount: changeEntries.length, written: slice.length };
@@ -2583,152 +2648,70 @@ function applyAttendanceMissingOnly(opts) {
 // Các hàm schedule-aware đã được xóa vì không còn cần thiết
 
 /**
- * Tính toán và cập nhật các cột BP-BT "Vân tay tuần" với số ca off vân tay theo từng tuần
- * Cột BU (TỔNG ca off vân tay) đã có hàm SUM tự động, không cần xử lý
+ * Cập nhật cột BU (TỔNG ca off vân tay) = số ca làm trong tháng, đếm từ dữ liệu vân tay (cột ngày AJ-BN).
+ * Mỗi ca có đủ check-in và check-out được tính 1 ca.
  * @param {boolean} dryRun - Nếu true chỉ preview, không ghi vào sheet
- * @return {Object} - Kết quả với số nhân viên đã cập nhật
+ * @return {Object} - { employeesCount, updatedCount, dryRun?, buCol? }
  */
-function updateVanTayTuanColumns(dryRun = true) {
+function updateTongCaOffVanTay(dryRun = true) {
   const MASTER_FILE_ID = "1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4";
   const MASTER_SHEET_NAME = "Chấm công th12/2025";
+  const FINGERPRINT_DAY_COL_MIN = 36;
+  const FINGERPRINT_DAY_COL_MAX = 66;
   const cfg = { morningStart: "08:30", afternoonStart: "13:15", cutoff: "12:00", lateThreshold: 30, maxTimesThreshold: 4 };
 
   Logger.log("1) Opening master sheet...");
   const masterSh = SpreadsheetApp.openById(MASTER_FILE_ID).getSheetByName(MASTER_SHEET_NAME);
   if (!masterSh) throw new Error("Không tìm thấy sheet tổng: " + MASTER_SHEET_NAME);
 
-  const masterInfo = buildMasterInfo_(masterSh, 2, 1);
+  const masterInfo = buildMasterInfo_(masterSh, 2, 1, FINGERPRINT_DAY_COL_MIN, FINGERPRINT_DAY_COL_MAX);
   const headerMap = findHeaderCols_(masterInfo.header);
-
-  if (!headerMap.vanTayTuanCols || headerMap.vanTayTuanCols.length === 0) {
-    throw new Error("Không tìm thấy các cột 'Vân tay tuần' (BP-BT) trong sheet tổng");
+  const buCol = headerMap.totalCaOffVanTayCol;
+  if (!buCol) {
+    throw new Error("Không tìm thấy cột TỔNG ca off vân tay (BU) trong sheet tổng");
   }
 
-  Logger.log("2) Found " + headerMap.vanTayTuanCols.length + " vân tay tuần columns:");
-  headerMap.vanTayTuanCols.forEach(vt => {
-    Logger.log(`   - Col ${vt.col}: ${vt.startDay}-${vt.endDay} (${vt.headerText})`);
-  });
-
-  Logger.log("3) Calculating off van tay counts for each week...");
   const lastEmpRow = masterInfo.lastEmpRow;
-  const weekCounts = new Map(); // Map<r0, Map<weekCol, count>>
+  const totals = []; // totals[r0] = số ca làm trong tháng
 
-  // Duyệt qua tất cả nhân viên có trong master sheet
+  Logger.log("2) Calculating total sessions per employee (from fingerprint data)...");
   for (const [emp, r1] of masterInfo.empToRow.entries()) {
     const r0 = r1 - 1;
     const role = masterInfo.empToRole ? masterInfo.empToRole.get(emp) : undefined;
     const schedule = getEmployeeSchedule_(emp, cfg, role);
-
-    const empWeekCounts = new Map();
-
-    // Tính số ca off cho từng tuần
-    for (const weekCol of headerMap.vanTayTuanCols) {
-      const offCount = calculateOffVanTayCountForWeek_(
-        r0,
-        weekCol.startDay,
-        weekCol.endDay,
-        masterInfo,
-        schedule,
-        cfg
-      );
-      empWeekCounts.set(weekCol.col, offCount);
-    }
-
-    weekCounts.set(r0, empWeekCounts);
+    const count = countCompleteSessionsInMonth_(r0, masterInfo, schedule, cfg);
+    totals[r0] = count;
   }
-
-  Logger.log("4) Calculated counts for " + weekCounts.size + " employees");
 
   if (dryRun) {
-    Logger.log("PREVIEW (dryRun) - Sample counts:");
+    Logger.log("PREVIEW (dryRun) - Sample TỔNG ca off vân tay (BU):");
     let i = 0;
-    for (const [r0, empWeekCounts] of weekCounts.entries()) {
-      const emp = Array.from(masterInfo.empToRow.entries()).find(([e, r]) => r === r0 + 1);
-      const countsStr = Array.from(empWeekCounts.entries())
-        .map(([col, count]) => `Col ${col}: ${count}`)
-        .join(", ");
-      Logger.log(`  Row ${r0 + 1} (${emp ? emp[0] : '?'}): ${countsStr}`);
-      if (++i >= 10) break;
+    for (const [emp, r1] of masterInfo.empToRow.entries()) {
+      const r0 = r1 - 1;
+      Logger.log(`  Row ${r1} (${emp}): ${totals[r0] || 0} ca`);
+      if (++i >= 15) break;
     }
-    return { employeesCount: weekCounts.size, dryRun: true };
+    return { employeesCount: masterInfo.empToRow.size, dryRun: true, buCol };
   }
 
-  // Cập nhật vào sheet
-  Logger.log("5) Updating vân tay tuần columns...");
-
-  // Chuẩn bị dữ liệu để ghi: Map<col, array of values>
-  // Lưu ý: r0 là 0-based index, nhưng hàng trong sheet bắt đầu từ 1 (hàng 1 = header)
-  // Dữ liệu nhân viên bắt đầu từ hàng 2, nên cần map r0 -> rowNum = r0 + 1
-  // Nhưng khi ghi, chỉ ghi từ hàng 2 đến lastEmpRow (bỏ qua hàng 1 header)
-  const dataRowCount = lastEmpRow - 1; // Số hàng dữ liệu (bỏ qua hàng header)
-  const columnValues = {};
-  for (const weekCol of headerMap.vanTayTuanCols) {
-    // Khởi tạo mảng với giá trị 0 cho tất cả các hàng dữ liệu (từ hàng 2)
-    columnValues[weekCol.col] = new Array(dataRowCount).fill(0);
+  Logger.log("3) Writing column BU (TỔNG ca off vân tay)...");
+  const headerValue = masterSh.getRange(1, buCol, 1, 1).getValue();
+  const writeValues = [[headerValue]];
+  for (let r0 = 1; r0 < lastEmpRow; r0++) {
+    writeValues.push([totals[r0] != null ? totals[r0] : 0]);
   }
+  const range = masterSh.getRange(1, buCol, lastEmpRow, 1);
+  range.setValues(writeValues);
 
-  // Cập nhật giá trị mới từ kết quả tính toán
-  let updatedCount = 0;
-  for (const [r0, empWeekCounts] of weekCounts.entries()) {
-    const rowNum = r0 + 1; // rowNum trong sheet (1-based)
-    if (rowNum > lastEmpRow) {
-      Logger.log(`WARNING: Row ${rowNum} exceeds lastEmpRow ${lastEmpRow}, skipping`);
-      continue;
-    }
-    if (rowNum === 1) {
-      Logger.log(`WARNING: Row ${rowNum} is header row, skipping`);
-      continue;
-    }
-
-    // Map rowNum (1-based) sang index trong mảng (0-based, bỏ qua hàng header)
-    const dataIndex = rowNum - 2; // Hàng 2 -> index 0, hàng 3 -> index 1, ...
-
-    for (const [col, count] of empWeekCounts.entries()) {
-      if (columnValues[col] && dataIndex >= 0 && dataIndex < columnValues[col].length) {
-        columnValues[col][dataIndex] = count;
-        Logger.log(`  Row ${rowNum}, Col ${col}: ${count} ca off`);
-      } else {
-        Logger.log(`WARNING: Column ${col} or dataIndex ${dataIndex} invalid`);
-      }
-    }
-    updatedCount++;
-  }
-
-  // Ghi tất cả các cột cùng lúc (bắt đầu từ hàng 2, bỏ qua hàng header)
-  Logger.log("6) Writing to sheet (starting from row 2)...");
-  let writeCount = 0;
-  for (const weekCol of headerMap.vanTayTuanCols) {
-    const values = columnValues[weekCol.col].map(x => [x || 0]);
-    try {
-      // Ghi từ hàng 2 đến lastEmpRow (bỏ qua hàng 1 header)
-      const range = masterSh.getRange(2, weekCol.col, dataRowCount, 1);
-      range.setValues(values);
-      Logger.log(`  ✓ Wrote column ${weekCol.col} (${weekCol.startDay}-${weekCol.endDay}) - rows 2 to ${lastEmpRow}`);
-      writeCount++;
-    } catch (e) {
-      Logger.log(`  ✗ ERROR writing column ${weekCol.col}: ${e.message}`);
-    }
-  }
-
-  Logger.log("7) Updated " + updatedCount + " employees across " + writeCount + " week columns");
-
-  try {
-    const ui = SpreadsheetApp.getUi();
-    ui.alert(`Hoàn thành! Đã cập nhật ${updatedCount} nhân viên trong ${writeCount} cột vân tay tuần.`);
-  } catch (e) {
-    Logger.log(`Alert skipped (no UI available). Updated ${updatedCount} employees in ${writeCount} columns.`);
-  }
-
-  return { employeesCount: updatedCount, weekColumnsCount: writeCount, dryRun: false };
+  Logger.log("4) Done. Updated TỔNG ca off vân tay (BU) for " + (lastEmpRow - 1) + " rows.");
+  return { employeesCount: lastEmpRow - 1, updatedCount: lastEmpRow - 1, dryRun: false, buCol };
 }
 
 /**
- * Helper function để ghi trực tiếp vào sheet (không preview)
- * Gọi hàm này để cập nhật các cột vân tay tuần
+ * Ghi trực tiếp cột BU (không preview).
  */
-function updateVanTayTuanColumnsCommit() {
-  Logger.log('Running commit: updateVanTayTuanColumns(dryRun=false)');
-  return updateVanTayTuanColumns(false);
+function updateTongCaOffVanTayCommit() {
+  return updateTongCaOffVanTay(false);
 }
 
 /**
