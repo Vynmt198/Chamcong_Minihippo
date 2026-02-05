@@ -15,19 +15,21 @@ Quy trình xử lý check-in/out ONL (Online) để phát hiện lỗi và ghi v
 - **Cột A (index 0):** Dấu thời gian (Timestamp) - thời gian submit form
 - **Cột C (index 2):** HỌ VÀ TÊN THẬT CỦA EM (Full Name)
 - **Cột E (index 4):** EM CHẤM CÔNG - chứa "CA ONLINE" hoặc "CA OFFLINE"
-- **Cột F (index 5):** EM CHẤM CÔNG CHO NGÀY NÀO - chứa Date object (ngày làm việc)
-- **Cột G (index 6):** CA LÀM VIỆC CỦA EM - chứa "Check in ca sáng" hoặc "Check out ca chiều" (KHÔNG có ngày)
+- **Cột G (index 6):** EM CHẤM CÔNG CHO NGÀY NÀO - chứa Date object (ngày ca làm việc)
+- **Cột H (index 7):** CA LÀM VIỆC CỦA EM - "Check in ca sáng", "Check out ca chiều", ...
+
+**Quy tắc 24h:** Check-in/check-out chỉ hợp lệ trong ngày đó. Nếu timestamp (A) khác ngày với cột G → bỏ dòng (không ghi). VD: check-in 01/12 8:22 hợp lệ; check-out 02/12 9:29 cho ca sáng 01/12 → bỏ; 01/12 ghi lỗi quên check out, ô 02/12 trống.
 
 **Logic parse:**
 1. Đọc từng row trong form sheet (bắt đầu từ row 2)
 2. Lọc chỉ lấy các row có `checkType` chứa "ONLINE" (bỏ qua "OFFLINE")
-3. Parse ngày từ cột F (Date object) → format "DD/MM"
-4. Parse ca từ cột G:
+3. Parse ngày từ cột G (Date object) → format "DD/MM"
+4. Parse ca và action từ cột H:
    - "ca sáng" hoặc "sáng" → `shiftType = 'morning'`
    - "ca chiều" hoặc "chiều" → `shiftType = 'afternoon'`
-5. Parse action từ cột G:
    - "Check in" → `action = 'in'`
    - "Check out" → `action = 'out'`
+5. Chỉ giữ row nếu timestamp (A) cùng ngày với cột G (quy tắc 24h)
 6. Parse timestamp từ cột A → Date object (thời gian check-in/out thực tế)
 
 **Output:** Array of objects:
@@ -48,10 +50,10 @@ Quy trình xử lý check-in/out ONL (Online) để phát hiện lỗi và ghi v
 **Điều kiện để entry được thêm vào data:**
 - `fullName` không rỗng
 - `checkType` chứa "ONLINE"
-- `date` không null (parse được từ cột F)
-- `shiftType` không null (parse được từ cột G)
-- `action` không null (parse được từ cột G)
-- `checkTime` không null (parse được từ cột A)
+- `date` không null (parse được từ cột G)
+- `shiftType` không null (parse được từ cột H)
+- `action` không null (parse được từ cột H)
+- Timestamp (A) cùng ngày với cột G (quy tắc 24h)
 
 ---
 
@@ -243,8 +245,8 @@ Với mỗi nhân viên có đăng ký ca ONL:
 
 ## ĐIỂM QUAN TRỌNG CẦN LƯU Ý
 
-1. **Cột F chứa ngày (Date object), không phải trong cột G**
-2. **Cột G chỉ có "Check in/out ca sáng/chiều", không có ngày**
+1. **Cột G chứa ngày (Date object) - EM CHẤM CÔNG CHO NGÀY NÀO**
+2. **Cột H chứa "Check in/out ca sáng/chiều" - CA LÀM VIỆC CỦA EM**
 3. **Chỉ xử lý các entry có "CA ONLINE", bỏ qua "CA OFFLINE"**
 4. **Map tên cần normalize để so khớp tốt hơn**
 5. **Đăng ký ca ONL chỉ lấy các ô có giá trị chính xác là "ONL"**

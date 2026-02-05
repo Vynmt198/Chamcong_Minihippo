@@ -6,9 +6,9 @@ function importAllBranchesRawLogToMaster() {
   // ====== CONFIG ======
   const RAW_FILE_ID = "1ed1IK4X1bQxhBoz4tjUKEypIv6cipNKsUCcXPKjqy8o";
   // Test 1 cơ sở trước:
-  const RAW_SHEETS = ["L4_HH"];
+  // const RAW_SHEETS = ["L4_HH"];
   // Khi OK thì bật đủ:
-  // const RAW_SHEETS = ["L4_HH", "L1_HH", "L5_HH", "HDK", "TP"];
+  const RAW_SHEETS = ["L4_HH", "L1_HH", "L5_HH", "HDK", "TP"];
 
   const MASTER_FILE_ID = "1kgPdAK4WxNE7bQSD7Oo62_fnf9WsUoGGyTgQZhJRFU4";  
   const MASTER_SHEET_NAME = "Chấm công th12/2025";
@@ -3046,22 +3046,26 @@ function loadOnlFormData_(formFileId) {
   // Cột A (index 0): Timestamp
   // Cột C (index 2): Họ tên
   // Cột E (index 4): EM CHẤM CÔNG - chứa "CA ONLINE" hoặc "CA OFFLINE"
-  // Cột F (index 5): EM CHẤM CÔNG CHO NGÀY NÀO - chứa Date object
-  // Cột G (index 6): CA LÀM VIỆC CỦA EM - chứa "Check in ca sáng" hoặc "Check out ca chiều"
+  // Cột G (index 6): EM CHẤM CÔNG CHO NGÀY NÀO - chứa Date object (ngày ca làm việc)
+  // Cột H (index 7): CA LÀM VIỆC CỦA EM - "Check in ca sáng", "Check out ca chiều", ...
+  // Quy tắc 24h: timestamp (A) phải cùng ngày với cột G. Check-out qua ngày hôm sau → bỏ qua, không ghi; 01/12 ghi lỗi quên check out, ô 02/12 trống.
 
   for (let r = 1; r < values.length; r++) {
     const row = values[r];
     const timestamp = row[0]; // Cột A
     const fullName = String(row[2] || '').trim(); // Cột C
     const checkType = String(row[4] || '').trim(); // Cột E
-    const checkDate = row[5]; // Cột F - Date object
-    const workShift = String(row[6] || '').trim(); // Cột G
+    const checkDate = row[6]; // Cột G - EM CHẤM CÔNG CHO NGÀY NÀO (Date object)
+    const workShift = String(row[7] != null && row[7] !== '' ? row[7] : '').trim(); // Cột H - CA LÀM VIỆC CỦA EM
 
     // Chỉ lấy các entry có "CA ONLINE"
     if (!checkType.toUpperCase().includes('ONLINE')) continue;
     if (!fullName) continue;
 
-    // Parse ngày từ cột F
+    // Timestamp phải là Date
+    if (!timestamp || !(timestamp instanceof Date) || isNaN(timestamp.getTime())) continue;
+
+    // Parse ngày từ cột G (EM CHẤM CÔNG CHO NGÀY NÀO)
     let dateStr = null, dayStr = null, monthStr = null;
     if (checkDate instanceof Date && !isNaN(checkDate.getTime())) {
       const day = checkDate.getDate();
@@ -3073,7 +3077,21 @@ function loadOnlFormData_(formFileId) {
     }
     if (!dateStr || !dayStr) continue;
 
-    // Parse ca và action từ cột G
+    // Quy tắc 24h: timestamp phải cùng ngày với checkDate (cột G). VD: check-in 01/12 8:22 (hợp lệ); check-out 02/12 9:29 cho ca sáng 01/12 → bỏ qua; 01/12 ghi quên check out, ô 02/12 trống.
+    try {
+      const tz = Session.getScriptTimeZone();
+      const tsKey = Utilities.formatDate(timestamp, tz, 'yyyy-MM-dd');
+      const cdKey = Utilities.formatDate(checkDate, tz, 'yyyy-MM-dd');
+      if (tsKey !== cdKey) {
+        Logger.log(`Skip ONL cross-day entry row=${r + 1}: ${fullName} ${checkType} "${workShift}" checkDate=${cdKey} ts=${tsKey}`);
+        continue;
+      }
+    } catch (e) {
+      Logger.log(`Skip ONL entry row=${r + 1} due to date-compare error: ${e && e.message ? e.message : e}`);
+      continue;
+    }
+
+    // Parse ca và action từ workShift (cột H - CA LÀM VIỆC CỦA EM)
     const workShiftLower = workShift.toLowerCase();
     let shiftType = null;
     let action = null;
@@ -3091,7 +3109,6 @@ function loadOnlFormData_(formFileId) {
     }
 
     if (!shiftType || !action) continue;
-    if (!timestamp || !(timestamp instanceof Date)) continue;
 
     data.push({
       timestamp: timestamp,
@@ -3727,24 +3744,14 @@ function buildOnlSessionsFromParsed_(parsed, morningStartMin, afternoonStartMin)
   // two
   const cutoff = timeStrToMinutes_('12:00') || 720;
   
-  if (t.length >= 4) {
-    // Với "onl 2 ca" và 4 times: [in_sáng, out_sáng, in_chiều, out_chiều] (đã được sort)
-    // Giả định: 2 times đầu = ca sáng, 2 times sau = ca chiều
-    // Validation: đảm bảo out_sáng < in_chiều (nếu không thì có thể dữ liệu sai)
-    const morningIn = t[0];
-    const morningOut = t[1];
-    const afternoonIn = t[2];
-    const afternoonOut = t[3];
-    
-    // Kiểm tra logic: out sáng phải < in chiều (trừ trường hợp đặc biệt)
-    const morningOutMin = timeStrToMinutes_(morningOut);
-    const afternoonInMin = timeStrToMinutes_(afternoonIn);
-    const isValid = morningOutMin !== null && afternoonInMin !== null && morningOutMin <= afternoonInMin;
-    
-    // Nếu không hợp lệ, vẫn xử lý nhưng có thể có vấn đề với dữ liệu
-    if (!isValid && morningOutMin !== null && afternoonInMin !== null) {
-      // Có thể dữ liệu bị đảo ngược hoặc sai format, nhưng vẫn xử lý theo logic chuẩn
-    }
+  if (parsed.times.length >= 4) {
+    // Với "onl 2 ca" và 4 times: thứ tự TRONG Ô = [in_sáng, out_sáng, in_chiều, out_chiều].
+    // Không sort theo giờ: check-out sáng có thể muộn (vd 23:30), check-in chiều 13:10 → sort sẽ gán sai (23:30 thành in chiều → báo trễ 615 phút). Dùng thứ tự gốc.
+    const order = parsed.times.slice(0, 4);
+    const morningIn = order[0];
+    const morningOut = order[1];
+    const afternoonIn = order[2];
+    const afternoonOut = order[3];
     
     out.push(
       { name: 'morning', in: morningIn, out: morningOut, lateMinutes: late(morningIn, morningStartMin) },
@@ -4645,22 +4652,26 @@ function loadOffFormData_(formFileId) {
   // Cột A (index 0): Timestamp
   // Cột C (index 2): Họ tên hoặc Mã nhân viên
   // Cột E (index 4): EM CHẤM CÔNG - chứa "CA ONLINE" hoặc "CA OFFLINE"
-  // Cột F (index 5): EM CHẤM CÔNG CHO NGÀY NÀO - chứa Date object
-  // Cột G (index 6): CA LÀM VIỆC CỦA EM - chứa "Check in ca sáng" hoặc "Check out ca chiều"
+  // Cột G (index 6): EM CHẤM CÔNG CHO NGÀY NÀO - chứa Date object (ngày ca làm việc)
+  // Cột H (index 7): CA LÀM VIỆC CỦA EM - "Check in ca sáng", "Check out ca chiều", ...
+  // Quy tắc 24h: timestamp (A) phải cùng ngày với cột G. Check-out qua ngày hôm sau → bỏ qua, không ghi (giống ONL).
 
   for (let r = 1; r < values.length; r++) {
     const row = values[r];
     const timestamp = row[0]; // Cột A
     const fullName = String(row[2] || '').trim(); // Cột C
     const checkType = String(row[4] || '').trim(); // Cột E
-    const checkDate = row[5]; // Cột F - Date object
-    const workShift = String(row[6] || '').trim(); // Cột G
+    const checkDate = row[6]; // Cột G - EM CHẤM CÔNG CHO NGÀY NÀO (Date object)
+    const workShift = String(row[7] != null && row[7] !== '' ? row[7] : '').trim(); // Cột H - CA LÀM VIỆC CỦA EM
 
     // Chỉ lấy các entry có "CA OFFLINE"
     if (!checkType.toUpperCase().includes('OFFLINE')) continue;
     if (!fullName) continue;
 
-    // Parse ngày từ cột F
+    // Timestamp phải là Date
+    if (!timestamp || !(timestamp instanceof Date) || isNaN(timestamp.getTime())) continue;
+
+    // Parse ngày từ cột G (EM CHẤM CÔNG CHO NGÀY NÀO)
     let dateStr = null, dayStr = null, monthStr = null;
     if (checkDate instanceof Date && !isNaN(checkDate.getTime())) {
       const day = checkDate.getDate();
@@ -4672,7 +4683,21 @@ function loadOffFormData_(formFileId) {
     }
     if (!dateStr || !dayStr) continue;
 
-    // Parse ca và action từ cột G
+    // Quy tắc 24h: timestamp phải cùng ngày với checkDate (cột G). Check-out qua ngày hôm sau → bỏ qua, không ghi.
+    try {
+      const tz = Session.getScriptTimeZone();
+      const tsKey = Utilities.formatDate(timestamp, tz, 'yyyy-MM-dd');
+      const cdKey = Utilities.formatDate(checkDate, tz, 'yyyy-MM-dd');
+      if (tsKey !== cdKey) {
+        Logger.log(`Skip OFF cross-day entry row=${r + 1}: ${fullName} ${checkType} "${workShift}" checkDate=${cdKey} ts=${tsKey}`);
+        continue;
+      }
+    } catch (e) {
+      Logger.log(`Skip OFF entry row=${r + 1} due to date-compare error: ${e && e.message ? e.message : e}`);
+      continue;
+    }
+
+    // Parse ca và action từ workShift (cột H - CA LÀM VIỆC CỦA EM)
     const workShiftLower = workShift.toLowerCase();
     let shiftType = null;
     let action = null;
@@ -4690,7 +4715,6 @@ function loadOffFormData_(formFileId) {
     }
 
     if (!shiftType || !action) continue;
-    if (!timestamp || !(timestamp instanceof Date)) continue;
 
     data.push({
       timestamp: timestamp,
@@ -4962,19 +4986,20 @@ function buildOffSessionsFromParsed_(parsed, morningStartMin, afternoonStartMin)
       lateMinutes: late(inStr, afternoonStartMin)
     });
   } else if (parsed.shiftType === 'two') {
-    if (t.length >= 4) {
-      // [in_sáng, out_sáng, in_chiều, out_chiều]
+    if (parsed.times.length >= 4) {
+      // Thứ tự TRONG Ô = [in_sáng, out_sáng, in_chiều, out_chiều] (giống ONL: không sort để tránh gán sai khi out sáng muộn)
+      const order = parsed.times.slice(0, 4);
       out.push({
         name: 'morning',
-        in: t[0],
-        out: t[1],
-        lateMinutes: late(t[0], morningStartMin)
+        in: order[0],
+        out: order[1],
+        lateMinutes: late(order[0], morningStartMin)
       });
       out.push({
         name: 'afternoon',
-        in: t[2],
-        out: t[3],
-        lateMinutes: late(t[2], afternoonStartMin)
+        in: order[2],
+        out: order[3],
+        lateMinutes: late(order[2], afternoonStartMin)
       });
     } else if (t.length === 3) {
       // Phân tích dựa trên cutoff (12:00) và thời gian bắt đầu ca chiều (thường 13:15)
@@ -5664,6 +5689,7 @@ function applyOffAttendanceLateOnly(opts) {
 /**
  * IMPORT GOOGLE FORM CHẤM CÔNG ONLINE -> SHEET TỔNG (Cột DO -> ES)
  * Xử lý CA ONLINE: fill vào cột DO -> ES với format "onl ca sáng", "onl ca chiều", "onl 2 ca"
+ * Quy tắc 24h: ngày ghi nhận lấy từ cột G (EM CHẤM CÔNG CHO NGÀY NÀO). Chỉ ghi khi timestamp (A) cùng ngày với cột G; check-out qua ngày hôm sau → bỏ, ô ngày hôm sau trống.
  */
 function importOnlineFormToMaster() {
   // ====== CONFIG ======
@@ -5678,17 +5704,17 @@ function importOnlineFormToMaster() {
   const ONLINE_START_COL = 119; // Cột DO (119 = DO)
   const ONLINE_END_COL = 149;   // Cột ES (149 = ES) = 31 cột
   
-  // Mapping cột trong form responses (0-based index)
+  // Mapping cột form: G = EM CHẤM CÔNG CHO NGÀY NÀO (ngày ca), H = CA LÀM VIỆC CỦA EM (0-based)
   const FORM_COL_TIMESTAMP = 0;      // A: Dấu thời gian
   const FORM_COL_EMAIL = 1;           // B: Email
-  const FORM_COL_EMP_CODE = 2;        // C: Mã nhân viên (đã sửa từ D sang C)
+  const FORM_COL_EMP_CODE = 2;        // C: Mã nhân viên
   const FORM_COL_NAME = 3;            // D: Họ và tên
   const FORM_COL_TEAM = 4;            // E: Team
-  const FORM_COL_DATE = 5;            // F: Ngày chấm công
-  const FORM_COL_SHIFT = 6;           // G: Ca làm việc
-  const FORM_COL_PROOF = 7;           // H: Minh chứng
-  const FORM_COL_TYPE = 9;            // J: EM CHẤM CÔNG CHO HÌNH THỨC (CA ONLINE / CA OFFLINE - CƠ SỞ KHÁC)
-  const FORM_COL_WORK_TYPE = 8;       // I: Hình thức làm việc (Parttime/Fulltime/Online)
+  const FORM_COL_DATE = 6;            // G: EM CHẤM CÔNG CHO NGÀY NÀO (ngày ca làm việc → ô ghi + quy tắc 24h)
+  const FORM_COL_SHIFT = 7;           // H: CA LÀM VIỆC CỦA EM
+  const FORM_COL_PROOF = 8;           // I: Minh chứng
+  const FORM_COL_TYPE = 9;            // J: EM CHẤM CÔNG CHO HÌNH THỨC (CA ONLINE / CA OFFLINE)
+  const FORM_COL_WORK_TYPE = 8;       // I: Hình thức làm việc
   
   Logger.log("1) Opening form responses sheet...");
   const formSS = SpreadsheetApp.openById(FORM_FILE_ID);
@@ -5790,6 +5816,7 @@ function importOnlineFormToMaster() {
   let skippedDate = 0;
   let skippedMonth = 0;
   let skippedTime = 0;
+  let skippedCrossDay = 0;
   let processed = 0;
   const skippedEmpCodes = new Set(); // Để log các mã bị skip
   const validEmpCodes = new Set(); // Để log các mã hợp lệ
@@ -5849,8 +5876,8 @@ function importOnlineFormToMaster() {
     const empCode = empCodeRaw.toUpperCase();
     validEmpCodes.add(empCode);
     
-    // Lấy ngày chấm công từ cột A (Dấu thời gian) và kiểm tra tháng 12/2025
-    const dateValue = row[FORM_COL_TIMESTAMP];
+    // Lấy ngày ca làm việc từ cột G (EM CHẤM CÔNG CHO NGÀY NÀO). Quy tắc 24h: timestamp (A) phải cùng ngày → khác ngày thì bỏ (ô 02/12 trống).
+    const dateValue = row[FORM_COL_DATE];
     let dayStr = null;
     let isDec2025 = false;
     let parsedYear = null;
@@ -5936,14 +5963,61 @@ function importOnlineFormToMaster() {
     dayStr = String(dayNum);
     
     // Lấy loại ca và timestamp
-    // Kiểm tra nếu shiftType là Date object thì bỏ qua (có thể đang lấy từ cột sai)
-    const shiftTypeRaw = row[actualShiftCol];
+    // Theo yêu cầu hiện tại: ưu tiên cột H (index 7) nếu chứa "check in/out"; fallback sang cột SHIFT đã detect; cuối cùng fallback sang cột G mặc định.
+    const isShiftText_ = (v) => {
+      if (!v) return false;
+      if (v instanceof Date) return false;
+      const s = String(v || '').toLowerCase();
+      return s.includes('check in') || s.includes('check out') || s.includes('checkin') || s.includes('checkout');
+    };
+    let shiftTypeRaw = row[actualShiftCol];
+    if (isShiftText_(row[7])) shiftTypeRaw = row[7]; // cột H (ưu tiên nếu đúng dữ liệu phân loại)
+    else if (isShiftText_(row[actualShiftCol])) shiftTypeRaw = row[actualShiftCol];
+    else if (isShiftText_(row[FORM_COL_SHIFT])) shiftTypeRaw = row[FORM_COL_SHIFT];
+
     if (shiftTypeRaw instanceof Date) {
-      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Shift column ${actualShiftCol} contains Date object instead of shift type text. Skipping.`);
+      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Shift value is Date object. Skipping.`);
       continue;
     }
     const shiftType = String(shiftTypeRaw || "").trim();
+
     const timestamp = row[FORM_COL_TIMESTAMP];
+
+    // Quy tắc hiệu lực 24h (theo ngày chấm công): timestamp phải cùng ngày với dateValue đã parse.
+    // Nếu check-out qua ngày hôm sau -> không tính (skip entry).
+    try {
+      const tz = Session.getScriptTimeZone();
+      const workDateObj = new Date(Number(parsedYear), Number(parsedMonth) - 1, Number(parsedDay), 12, 0, 0);
+      const workKey = Utilities.formatDate(workDateObj, tz, 'yyyy-MM-dd');
+      let tsKey = null;
+      if (timestamp instanceof Date && !isNaN(timestamp.getTime())) {
+        tsKey = Utilities.formatDate(timestamp, tz, 'yyyy-MM-dd');
+      } else {
+        const tsStr = String(timestamp || '').trim();
+        const m1 = tsStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+        const m2 = !m1 ? tsStr.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/) : null;
+        if (m1) {
+          const d = Number(m1[1]), mo = Number(m1[2]), y = Number(m1[3]);
+          const dt = new Date(y, mo - 1, d, 12, 0, 0);
+          tsKey = Utilities.formatDate(dt, tz, 'yyyy-MM-dd');
+        } else if (m2) {
+          const y = Number(m2[1]), mo = Number(m2[2]), d = Number(m2[3]);
+          const dt = new Date(y, mo - 1, d, 12, 0, 0);
+          tsKey = Utilities.formatDate(dt, tz, 'yyyy-MM-dd');
+        }
+      }
+      if (!tsKey || tsKey !== workKey) {
+        skippedCrossDay++;
+        if (processed < 5 && empCode) {
+          Logger.log(`   Skip cross-day entry Row ${r + 1}, emp=${empCode}, day=${dayStr}: workKey=${workKey}, tsKey=${tsKey}, shift="${shiftType}"`);
+        }
+        continue;
+      }
+    } catch (e) {
+      skippedCrossDay++;
+      Logger.log(`   Skip entry Row ${r + 1} due to cross-day check error: ${e && e.message ? e.message : e}`);
+      continue;
+    }
     
     // Parse timestamp để lấy giờ
     let timeStr = null;
@@ -6002,7 +6076,7 @@ function importOnlineFormToMaster() {
   }
   
   Logger.log(`   Parsed ${onlineByEmpDay.size} employees with online check-in data`);
-  Logger.log(`   Stats: processed=${processed}, skippedType=${skippedType}, skippedEmp=${skippedEmp}, skippedMonth=${skippedMonth}, skippedDate=${skippedDate}, skippedTime=${skippedTime}`);
+  Logger.log(`   Stats: processed=${processed}, skippedType=${skippedType}, skippedEmp=${skippedEmp}, skippedMonth=${skippedMonth}, skippedDate=${skippedDate}, skippedTime=${skippedTime}, skippedCrossDay=${skippedCrossDay}`);
   
   // Log các dòng có mã hợp lệ nhưng bị skip
   if (validButSkipped.length > 0) {
@@ -6210,7 +6284,7 @@ function importOnlineFormToMaster() {
 
 /**
  * IMPORT GOOGLE FORM CHẤM CÔNG OFFLINE -> SHEET TỔNG (Cột CB -> DF)
- * Xử lý CA OFFLINE - CƠ SỞ KHÁC: fill vào cột CB -> DF với format "off ca sáng", "off ca chiều", "off 2 ca"
+ * Xử lý CA OFFLINE: fill vào cột CB -> DF. Quy tắc 24h giống ONL: ngày từ cột G, chỉ ghi khi timestamp (A) cùng ngày với G.
  */
 function importOfflineFormToMaster() {
   // ====== CONFIG ======
@@ -6225,17 +6299,17 @@ function importOfflineFormToMaster() {
   const OFFLINE_START_COL = 80;  // Cột CB (80 = CB)
   const OFFLINE_END_COL = 110;   // Cột DF (110 = DF) = 31 cột
   
-  // Mapping cột trong form responses (0-based index)
+  // Mapping cột form: G = EM CHẤM CÔNG CHO NGÀY NÀO, H = CA LÀM VIỆC CỦA EM (0-based)
   const FORM_COL_TIMESTAMP = 0;      // A: Dấu thời gian
   const FORM_COL_EMAIL = 1;           // B: Email
-  const FORM_COL_EMP_CODE = 2;        // C: Mã nhân viên (đã sửa từ D sang C)
+  const FORM_COL_EMP_CODE = 2;        // C: Mã nhân viên
   const FORM_COL_NAME = 3;            // D: Họ và tên
   const FORM_COL_TEAM = 4;            // E: Team
-  const FORM_COL_DATE = 5;            // F: Ngày chấm công
-  const FORM_COL_SHIFT = 6;           // G: Ca làm việc
-  const FORM_COL_PROOF = 7;           // H: Minh chứng
-  const FORM_COL_TYPE = 9;            // J: EM CHẤM CÔNG CHO HÌNH THỨC (CA ONLINE / CA OFFLINE - CƠ SỞ KHÁC)
-  const FORM_COL_WORK_TYPE = 8;       // I: Hình thức làm việc (Parttime/Fulltime/Online)
+  const FORM_COL_DATE = 6;            // G: EM CHẤM CÔNG CHO NGÀY NÀO
+  const FORM_COL_SHIFT = 7;           // H: CA LÀM VIỆC CỦA EM
+  const FORM_COL_PROOF = 8;           // I: Minh chứng
+  const FORM_COL_TYPE = 9;            // J: EM CHẤM CÔNG CHO HÌNH THỨC (CA ONLINE / CA OFFLINE)
+  const FORM_COL_WORK_TYPE = 8;       // I: Hình thức làm việc
   
   Logger.log("1) Opening form responses sheet...");
   const formSS = SpreadsheetApp.openById(FORM_FILE_ID);
@@ -6337,6 +6411,7 @@ function importOfflineFormToMaster() {
   let skippedDate = 0;
   let skippedMonth = 0;
   let skippedTime = 0;
+  let skippedCrossDay = 0;
   let processed = 0;
   const skippedEmpCodes = new Set(); // Để log các mã bị skip
   const validEmpCodes = new Set(); // Để log các mã hợp lệ
@@ -6397,8 +6472,8 @@ function importOfflineFormToMaster() {
     const empCode = empCodeRaw.toUpperCase();
     validEmpCodes.add(empCode);
     
-    // Lấy ngày chấm công từ cột A (Dấu thời gian) và kiểm tra tháng 12/2025
-    const dateValue = row[FORM_COL_TIMESTAMP];
+    // Lấy ngày ca làm việc từ cột G (EM CHẤM CÔNG CHO NGÀY NÀO). Quy tắc 24h: timestamp (A) phải cùng ngày → khác ngày thì bỏ.
+    const dateValue = row[FORM_COL_DATE];
     let dayStr = null;
     let isDec2025 = false;
     let parsedYear = null;
@@ -6484,14 +6559,60 @@ function importOfflineFormToMaster() {
     dayStr = String(dayNum);
     
     // Lấy loại ca và timestamp
-    // Kiểm tra nếu shiftType là Date object thì bỏ qua (có thể đang lấy từ cột sai)
-    const shiftTypeRaw = row[actualShiftCol];
+    // Theo yêu cầu hiện tại: ưu tiên cột H (index 7) nếu chứa "check in/out"; fallback sang cột SHIFT đã detect; cuối cùng fallback sang cột G mặc định.
+    const isShiftText_ = (v) => {
+      if (!v) return false;
+      if (v instanceof Date) return false;
+      const s = String(v || '').toLowerCase();
+      return s.includes('check in') || s.includes('check out') || s.includes('checkin') || s.includes('checkout');
+    };
+    let shiftTypeRaw = row[actualShiftCol];
+    if (isShiftText_(row[7])) shiftTypeRaw = row[7]; // cột H (ưu tiên nếu đúng dữ liệu phân loại)
+    else if (isShiftText_(row[actualShiftCol])) shiftTypeRaw = row[actualShiftCol];
+    else if (isShiftText_(row[FORM_COL_SHIFT])) shiftTypeRaw = row[FORM_COL_SHIFT];
+
     if (shiftTypeRaw instanceof Date) {
-      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Shift column ${actualShiftCol} contains Date object instead of shift type text. Skipping.`);
+      Logger.log(`   WARNING: Row ${r + 1}, emp=${empCode}, day=${dayStr}: Shift value is Date object. Skipping.`);
       continue;
     }
     const shiftType = String(shiftTypeRaw || "").trim();
+
     const timestamp = row[FORM_COL_TIMESTAMP];
+
+    // Quy tắc hiệu lực 24h (theo ngày chấm công): timestamp phải cùng ngày với dateValue đã parse.
+    try {
+      const tz = Session.getScriptTimeZone();
+      const workDateObj = new Date(Number(parsedYear), Number(parsedMonth) - 1, Number(parsedDay), 12, 0, 0);
+      const workKey = Utilities.formatDate(workDateObj, tz, 'yyyy-MM-dd');
+      let tsKey = null;
+      if (timestamp instanceof Date && !isNaN(timestamp.getTime())) {
+        tsKey = Utilities.formatDate(timestamp, tz, 'yyyy-MM-dd');
+      } else {
+        const tsStr = String(timestamp || '').trim();
+        const m1 = tsStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+        const m2 = !m1 ? tsStr.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/) : null;
+        if (m1) {
+          const d = Number(m1[1]), mo = Number(m1[2]), y = Number(m1[3]);
+          const dt = new Date(y, mo - 1, d, 12, 0, 0);
+          tsKey = Utilities.formatDate(dt, tz, 'yyyy-MM-dd');
+        } else if (m2) {
+          const y = Number(m2[1]), mo = Number(m2[2]), d = Number(m2[3]);
+          const dt = new Date(y, mo - 1, d, 12, 0, 0);
+          tsKey = Utilities.formatDate(dt, tz, 'yyyy-MM-dd');
+        }
+      }
+      if (!tsKey || tsKey !== workKey) {
+        skippedCrossDay++;
+        if (processed < 5 && empCode) {
+          Logger.log(`   Skip cross-day entry Row ${r + 1}, emp=${empCode}, day=${dayStr}: workKey=${workKey}, tsKey=${tsKey}, shift="${shiftType}"`);
+        }
+        continue;
+      }
+    } catch (e) {
+      skippedCrossDay++;
+      Logger.log(`   Skip entry Row ${r + 1} due to cross-day check error: ${e && e.message ? e.message : e}`);
+      continue;
+    }
     
     // Parse timestamp để lấy giờ
     let timeStr = null;
@@ -6550,7 +6671,7 @@ function importOfflineFormToMaster() {
   }
   
   Logger.log(`   Parsed ${offlineByEmpDay.size} employees with offline check-in data`);
-  Logger.log(`   Stats: processed=${processed}, skippedType=${skippedType}, skippedEmp=${skippedEmp}, skippedMonth=${skippedMonth}, skippedDate=${skippedDate}, skippedTime=${skippedTime}`);
+  Logger.log(`   Stats: processed=${processed}, skippedType=${skippedType}, skippedEmp=${skippedEmp}, skippedMonth=${skippedMonth}, skippedDate=${skippedDate}, skippedTime=${skippedTime}, skippedCrossDay=${skippedCrossDay}`);
   
   // Log các dòng có mã hợp lệ nhưng bị skip
   if (validButSkipped.length > 0) {
@@ -6754,4 +6875,131 @@ function importOfflineFormToMaster() {
   } catch (e) {
     Logger.log(`Notification skipped. Finished: Updated ${updatedCells} ô.`);
   }
+}
+
+// ==================== MENU BUTTONS (GOOGLE SHEET UI) ====================
+
+/**
+ * Tạo menu khi mở Google Sheet.
+ * LƯU Ý: Menu chỉ hiện khi script gắn với Spreadsheet và user có quyền chạy.
+ */
+function onOpen(e) {
+  try {
+    buildChamCongMenu_();
+  } catch (err) {
+    // Không throw để tránh làm lỗi onOpen
+    Logger.log('onOpen error: ' + (err && err.message ? err.message : err));
+  }
+}
+
+function buildChamCongMenu_() {
+  const ui = SpreadsheetApp.getUi();
+  const menu = ui.createMenu('CHẤM CÔNG');
+
+  menu.addSubMenu(
+    ui.createMenu('Vân tay (OFF)')
+      .addItem('Import data vân tay', 'UI_importVanTay')
+      .addSeparator()
+      .addItem('Xử lí quên check in/out (OFF vân tay)', 'UI_offVanTayMissing')
+      .addItem('Xử lí trễ (OFF vân tay)', 'UI_offVanTayLate')
+      .addSeparator()
+      .addItem('Tổng ca tháng (BU)', 'UI_totalCaThang')
+      .addSeparator()
+      .addItem('Highlight Lỗi trễ và quên check in out tự động', 'UI_highlightError')
+  );
+
+  menu.addSubMenu(
+    ui.createMenu('ONL (Form)')
+      .addItem('Import data chấm công ONL form (DO-ES)', 'UI_importOnlForm')
+      .addSeparator()
+      .addItem('Xử lí quên check in/out (ONL form)', 'UI_onlMissing')
+      .addItem('Xử lí trễ (ONL form)', 'UI_onlLate')
+  );
+
+  menu.addSubMenu(
+    ui.createMenu('OFF ngoài (Form)')
+      .addItem('Import data chấm công OFF ngoài form (CB-DF)', 'UI_importOffNgoaiForm')
+      .addSeparator()
+      .addItem('Xử lí quên check in/out (OFF ngoài)', 'UI_offNgoaiMissing')
+      .addItem('Xử lí trễ (OFF ngoài)', 'UI_offNgoaiLate')
+  );
+
+  menu.addToUi();
+}
+
+function UI_confirmRun_(title, message) {
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.alert(title, message + '\n\nBấm OK để chạy, Cancel để huỷ.', ui.ButtonSet.OK_CANCEL);
+  return res === ui.Button.OK;
+}
+
+function UI_run_(title, fn) {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const out = fn();
+    SpreadsheetApp.getActiveSpreadsheet().toast(`${title}: OK`, 'Hoàn thành', 5);
+    return out;
+  } catch (e) {
+    const msg = (e && e.message) ? e.message : String(e);
+    ui.alert(`${title}: LỖI`, msg, ui.ButtonSet.OK);
+    throw e;
+  }
+}
+
+// -------- Vân tay (OFF) --------
+function UI_importVanTay() {
+  if (!UI_confirmRun_('Import data vân tay', 'Sẽ import rawlog vân tay (nhiều cơ sở) vào sheet tổng.')) return;
+  return UI_run_('Import data vân tay', () => importAllBranchesRawLogToMaster());
+}
+
+function UI_offVanTayMissing() {
+  if (!UI_confirmRun_('OFF vân tay - Quên check in/out', 'Sẽ xử lí QUÊN check in/out từ dữ liệu vân tay (OFF).')) return;
+  return UI_run_('OFF vân tay - Quên check in/out', () => applyAttendanceMissingOnly({ dryRun: false }));
+}
+
+function UI_offVanTayLate() {
+  if (!UI_confirmRun_('OFF vân tay - Trễ', 'Sẽ xử lí TRỄ từ dữ liệu vân tay (OFF).')) return;
+  return UI_run_('OFF vân tay - Trễ', () => applyAttendanceLateOnly({ dryRun: false }));
+}
+
+function UI_totalCaThang() {
+  if (!UI_confirmRun_('Tổng ca tháng (BU)', 'Sẽ cập nhật cột BU = tổng ca off vân tay theo tháng hiện tại của sheet.')) return;
+  return UI_run_('Tổng ca tháng (BU)', () => updateTongCaOffVanTayCommit());
+}
+
+function UI_highlightError() {
+  if (!UI_confirmRun_('Highlight Lỗi trễ và quên check in out tự động', 'Sẽ highlight lỗi trễ và quên check in out tự động trong sheet tổng.')) return;
+  return UI_run_('Highlight Lỗi trễ và quên check in out tự động', () => highlightProblematicCells());
+}
+
+// -------- ONL (Form) --------
+function UI_importOnlForm() {
+  if (!UI_confirmRun_('Import ONL form', 'Sẽ import dữ liệu chấm công ONL từ form vào cột DO-ES.')) return;
+  return UI_run_('Import ONL form', () => importOnlineFormToMaster());
+}
+
+function UI_onlMissing() {
+  if (!UI_confirmRun_('ONL - Quên check in/out', 'Sẽ xử lí QUÊN check in/out (và trễ >= 30 quy về quên) từ dữ liệu ONL.')) return;
+  return UI_run_('ONL - Quên check in/out', () => applyOnlAttendanceMissingOnly({ dryRun: false }));
+}
+
+function UI_onlLate() {
+  if (!UI_confirmRun_('ONL - Trễ', 'Sẽ xử lí TRỄ (<= 30 phút) từ dữ liệu ONL.')) return;
+  return UI_run_('ONL - Trễ', () => applyOnlAttendanceLateOnly({ dryRun: false }));
+}
+
+// -------- OFF ngoài (Form) --------
+function UI_importOffNgoaiForm() {
+  if (!UI_confirmRun_('Import OFF ngoài form', 'Sẽ import dữ liệu chấm công OFF ngoài từ form vào cột CB-DF.')) return;
+  return UI_run_('Import OFF ngoài form', () => importOfflineFormToMaster());
+}
+
+function UI_offNgoaiMissing() {
+  if (!UI_confirmRun_('OFF ngoài - Quên check in/out', 'Sẽ xử lí QUÊN check in/out (và trễ >= 30 quy về quên) từ dữ liệu OFF ngoài.')) return;
+  return UI_run_('OFF ngoài - Quên check in/out', () => applyOffAttendanceMissingOnly({ dryRun: false }));
+}
+
+function UI_offNgoaiLate() {
+  if (!UI_confirmRun_('OFF ngoài - Trễ', 'Sẽ xử lí TRỄ (<= 30 phút) từ dữ liệu OFF ngoài.')) return;
+  return UI_run_('OFF ngoài - Trễ', () => applyOffAttendanceLateOnly({ dryRun: false }));
 }
