@@ -15,6 +15,9 @@ function importAllBranchesRawLogToMaster() {
 
   const MASTER_EMP_COL = 2;     // cột mã nhân viên (B)
   const MASTER_HEADER_ROW = 1;  // hàng chứa số ngày 1..31
+  // Khối cột ghi rawlog vân tay: bắt buộc từ AJ (36) đến BN (66)
+  const MASTER_DAY_FIRST_COL = 36;  // AJ
+  const MASTER_DAY_LAST_COL = 66;   // BN
 
   // ====== 1) OPEN RAW FILE ======
   Logger.log("1) Open raw file...");
@@ -59,26 +62,16 @@ function importAllBranchesRawLogToMaster() {
   });
   Logger.log("rowByEmp size=" + rowByEmp.size);
 
-  // ====== 5) BUILD colByDay + find day range ======
-  const lastCol = masterSh.getLastColumn();
-  const header = masterSh.getRange(MASTER_HEADER_ROW, 1, 1, lastCol).getValues()[0];
-
+  // ====== 5) BUILD colByDay: cố định theo vị trí AJ=ngày 1 .. BN=ngày 31 ======
+  const minDayCol = MASTER_DAY_FIRST_COL;
+  const maxDayCol = MASTER_DAY_LAST_COL;
   const colByDay = new Map(); // dayStr -> col (1-based)
-  let minDayCol = null, maxDayCol = null;
-
-  for (let c = 0; c < header.length; c++) {
-    const day = parseDayFromValue_(header[c]);
-    if (day) {
-      const col1 = c + 1;
-      colByDay.set(day, col1);
-      if (minDayCol === null || col1 < minDayCol) minDayCol = col1;
-      if (maxDayCol === null || col1 > maxDayCol) maxDayCol = col1;
-    }
+  for (let d = 1; d <= 31; d++) {
+    colByDay.set(String(d), MASTER_DAY_FIRST_COL + (d - 1));
+    if (d <= 9) colByDay.set("0" + d, MASTER_DAY_FIRST_COL + (d - 1)); // raw có thể gửi "01".."09"
   }
 
-  Logger.log("colByDay size=" + colByDay.size + ", minDayCol=" + minDayCol + ", maxDayCol=" + maxDayCol);
-
-  if (minDayCol === null) throw new Error("Không tìm thấy header ngày 1..31 trong sheet tổng.");
+  Logger.log("colByDay size=" + colByDay.size + ", day block cols " + minDayCol + ".." + maxDayCol + " (AJ..BN)");
 
   // ====== 6) READ dayBlock ONCE ======
   const dayColsCount = maxDayCol - minDayCol + 1;
